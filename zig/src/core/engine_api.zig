@@ -399,6 +399,8 @@ pub const LoneHooks = struct {
 
 /// The lane core served to the HTTP threads (lane_host.zig).
 pub const LaneHost = @import("lane_host.zig").LaneHost;
+/// An opt-in family round planner for the lane host, in place of its `prefill_step` chunks (lane_rounds.zig).
+pub const Rounds = @import("lane_host.zig").Rounds;
 
 /// Exact prompt reuse between requests, for any family (prompt_cache.zig).
 pub const prompt_cache = @import("prompt_cache.zig");
@@ -418,6 +420,7 @@ pub const keepalive = @import("keepalive.zig");
 test {
     _ = @import("lane_host.zig");
     _ = @import("lane_host_test.zig");
+    _ = @import("lane_rounds_test.zig");
     _ = @import("lane_host_reuse_test.zig");
     _ = @import("lane_host_warm_test.zig");
     _ = @import("lane_host_fill_test.zig");
