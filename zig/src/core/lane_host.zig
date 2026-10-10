@@ -22,6 +22,7 @@ pub const Rounds = rounds.Rounds;
 pub const Proposers = rounds.Proposers;
 const rounds = @import("lane_rounds.zig");
 const lane_stream = @import("lane_stream.zig");
+const lane_halt = @import("lane_halt.zig");
 
 pub const LaneHost = struct {
     gpa: Allocator,
@@ -38,6 +39,8 @@ pub const LaneHost = struct {
     filling: std.ArrayList(*Job) = .empty, // admitted jobs whose prompt is still going in, a chunk a round, oldest first
     cancels: std.ArrayList(Id) = .empty,
     closing: bool = false,
+    /// `halt`'s reason: what is left finishes failed with it (null: a stop cancels what is left)
+    halt_reason: ?[]const u8 = null,
     thread: ?std.Thread = null,
     decoded: std.ArrayList(status.Mark) = .empty, // tokens a round landed, for the 2 s decode rate
     prefill_rate: f64 = 0,
@@ -120,7 +123,7 @@ pub const LaneHost = struct {
         h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
     }
 
-    /// Stops admitting, cancels what is left and joins the engine thread.
+    /// Stops admitting, cancels what is left and joins the engine thread (after `halt`: the thread is gone already).
     pub fn stop(h: *LaneHost) void {
         h.mutex.lockUncancelable(h.io);
         h.closing = true;
@@ -140,6 +143,9 @@ pub const LaneHost = struct {
         h.pieces.deinit(h.gpa);
         h.finals.deinit(h.gpa);
     }
+
+    /// A drain's deadline: the round in flight completes on every rank, so the ranks stop at the same boundary.
+    pub const halt = lane_halt.halt;
 
     pub fn engine(h: *LaneHost) Engine {
         return .{ .ctx = h, .vtable = &.{ .info = infoFn, .submit = submitFn, .cancel = cancelFn, .status = status.read, .memory = memoryFn, .keepalive = keepaliveFn, .learn = learn.submit } };
@@ -454,10 +460,13 @@ pub const LaneHost = struct {
 
     const alone_words = "the engine has no memory for this request's caches with nothing else running: lower --context or --parallel";
 
-    /// A job cancelled in its prompt pass, its lane already released.
+    /// A job cancelled in its prompt pass, its lane already released (by a `halt`: failed with its reason).
     pub fn cancel(h: *LaneHost, job: *Job) bool {
         h.remove(job);
-        h.finish(job, .cancelled, "");
+        h.lock();
+        const why = h.halt_reason;
+        h.unlock();
+        h.finish(job, if (why == null) .cancelled else .failed, why orelse "");
         return true;
     }
 
@@ -541,6 +550,7 @@ pub const LaneHost = struct {
     }
 
     pub fn closeAll(h: *LaneHost) void {
+        if (h.halt_reason) |reason| return lane_halt.haltAll(h, reason);
         h.lock();
         for (h.queued.items) |job| h.cancels.append(h.gpa, job.id) catch {};
         for (h.admitted.items) |job| h.cancels.append(h.gpa, job.id) catch {};
@@ -557,4 +567,5 @@ pub fn born(r: *const Request) u32 {
 test {
     _ = @import("lane_host_test.zig");
     _ = @import("lane_rounds_test.zig");
+    _ = @import("lane_halt_test.zig");
 }
