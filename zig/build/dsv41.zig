@@ -76,10 +76,11 @@ pub fn add(b: *std.Build, test_step: *std.Build.Step) void {
         step.dependOn(&run.step);
         test_step.dependOn(&run.step);
     }
-    // the prefill emitter's own suites, each its own test root (also in test-dsv41 and `zig build test`)
+    // the prefill emitter's and DSpark's own suites, each its own test root (also in test-dsv41 and `zig build test`)
     const suites = [_][3][]const u8{
         .{ "test-dsv41-gm2pf", "gm2pf_test.zig", "DeepSeek-V4.1 x3gm v2 (TF_DSV41_GM_V2) on the real prefill emitter, host only" },
         .{ "test-dsv41-longpf", "longpf_test.zig", "DeepSeek-V4.1 long prompts (stream top-k, split KV's row blocks) on the real prefill emitter, host only" },
+        .{ "test-dsv41-slot-drafts", "slot_drafts_test.zig", "DeepSeek-V4.1 DSpark drafting over several slots on the real emitter, host only" },
     };
     for (suites) |x| {
         const run = b.addRunArtifact(b.addTest(.{ .root_module = rooted(b, host, .debug, x[1]) }));

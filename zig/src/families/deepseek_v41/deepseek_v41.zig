@@ -46,6 +46,8 @@ test {
     _ = @import("streamrb_test.zig"); // the stream top-k's read-back twins on the prefill emitter
     // the keyed sampler's pipeline and device steps (TF_DSV41_SAMPLING; its golden runs in test-dsv41-sampling)
     inline for (.{ @import("sampling_pipe.zig"), @import("sampling_dev.zig"), @import("sampling_gpu.zig") }) |t| std.testing.refAllDecls(t);
+    // DSpark's pass on the GPU (one slot; several slots' statics and messages): compiled on the host
+    inline for (.{ @import("dspark_dev.zig"), @import("dspark_emit.zig"), @import("dspark_gpu.zig"), @import("dspark_gpu_device.zig"), @import("dspark_layout.zig"), @import("dspark_rows.zig") }) |t| std.testing.refAllDecls(t);
     // prepared weight folders (TF_DSV41_PREPARED)
     _ = @import("prepared.zig");
 }
