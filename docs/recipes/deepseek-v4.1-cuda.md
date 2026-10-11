@@ -33,3 +33,5 @@ Paths under `zig/src/families/deepseek_v41/`. Host suites (`zig build test-dsv41
 - `fixtures/lanes-ref.bin`: the run-time lane layout (`prepare.zig`).
 - `fixtures/engram-hash-ref.bin` and `fixtures/engram-rows-ref.txt`: Engram's hasher and rows (`engram_host.zig`,
   `engram_rows_test.zig`).
+- Not stored: the device kernel fixtures (`cuda_tests/oracle.py`, `cuda_tests/dsv41_capture.py` in the tools)
+  that `tf-dsv41-test all DIR` and `tf-dsv41-test replay DIR` compare on a GPU.
