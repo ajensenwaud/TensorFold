@@ -41,3 +41,6 @@ Paths under `zig/src/families/deepseek_v41/`. Host suites (`zig build test-dsv41
   `fixtures/chain-op-cap16.json`: the drafting chain's op cap (`slot_drafts_chain_test.zig`).
 - `fixtures/serve/sampling.jsonl`: keyed sampling against the reference rule (`serve/golden_test.zig`;
   `zig build test-dsv41-sampling`).
+- `draft/fixtures/{golden,calib-golden,calib-measure-golden,lookup-golden,spec-golden}.json`: drafting depth,
+  calibration, lookup and speculation against the reference engine's traces (`draft/*_test.zig`;
+  `zig build test-dsv41-draft`).

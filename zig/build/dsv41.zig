@@ -87,6 +87,14 @@ pub fn add(b: *std.Build, test_step: *std.Build.Step) void {
         step.dependOn(&run.step);
         test_step.dependOn(&run.step);
     }
+    // drafting (DSpark depth, trees, the lanes backend) on the CPU twin and the reference's golden traces
+    const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    const draft = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/draft/draft.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    draft.addImport("lanes", lanes);
+    const draft_run = b.addRunArtifact(b.addTest(.{ .root_module = draft }));
+    b.step("test-dsv41-draft", "DeepSeek-V4.1's drafting and lanes backend on the CPU twin (no GPU work)").dependOn(&draft_run.step);
+    step.dependOn(&draft_run.step);
+    test_step.dependOn(&draft_run.step);
     // the device runner compiles on any host; running it needs a GPU and every family image
     const compiled = &runner(b, host, .debug, runtime(b, host, .debug), false).step;
     step.dependOn(compiled);
