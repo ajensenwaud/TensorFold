@@ -38,7 +38,12 @@ pub fn kernels(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
 
 /// The family's host side (config, pack headers, weight plan, kernel bindings, the forward over `tp` and `kv`).
 pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/deepseek_v41.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    return rooted(b, target, optimize, "deepseek_v41.zig");
+}
+
+/// The family's sources with their imports, rooted at `file` (a file of zig/src/families/deepseek_v41).
+fn rooted(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, file: []const u8) *std.Build.Module {
+    const m = b.createModule(.{ .root_source_file = b.path(b.fmt("zig/src/families/deepseek_v41/{s}", .{file})), .target = target, .optimize = optimize, .link_libc = true });
     const cuda = runtime(b, target, optimize);
     m.addImport("core", core(b, target, optimize));
     m.addImport("cuda", cuda);
@@ -63,6 +68,17 @@ pub fn add(b: *std.Build, test_step: *std.Build.Step) void {
     const family = b.addRunArtifact(b.addTest(.{ .root_module = module(b, host, .debug) }));
     const bindings = b.addRunArtifact(b.addTest(.{ .root_module = kernels(b, host, .debug, runtime(b, host, .debug)) }));
     for ([_]*std.Build.Step.Run{ family, bindings }) |run| {
+        step.dependOn(&run.step);
+        test_step.dependOn(&run.step);
+    }
+    // the prefill emitter's own suites, each its own test root (also in test-dsv41 and `zig build test`)
+    const suites = [_][3][]const u8{
+        .{ "test-dsv41-gm2pf", "gm2pf_test.zig", "DeepSeek-V4.1 x3gm v2 (TF_DSV41_GM_V2) on the real prefill emitter, host only" },
+        .{ "test-dsv41-longpf", "longpf_test.zig", "DeepSeek-V4.1 long prompts (stream top-k, split KV's row blocks) on the real prefill emitter, host only" },
+    };
+    for (suites) |x| {
+        const run = b.addRunArtifact(b.addTest(.{ .root_module = rooted(b, host, .debug, x[1]) }));
+        b.step(x[0], x[2]).dependOn(&run.step);
         step.dependOn(&run.step);
         test_step.dependOn(&run.step);
     }

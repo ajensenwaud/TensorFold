@@ -37,6 +37,13 @@ test {
     inline for (.{ @import("forward.zig"), @import("forward_engram.zig"), @import("forward_follow.zig"), @import("forward_glue.zig"), @import("forward_graph.zig"), @import("forward_hooks.zig"), @import("forward_sample.zig"), @import("kv_state.zig"), @import("run.zig"), @import("triton_call.zig"), @import("kv_glue_emit_test.zig") }) |t| std.testing.refAllDecls(t);
     _ = @import("graphs.zig"); // the decode graphs' buckets, statics and floor
     _ = @import("greedy.zig"); // greedy's host step
+    // the prompt's prefill: segments over the prefill emitter, CED, long prompts, x3gm v2 (hooks for images unset)
+    inline for (.{ @import("block_prefill.zig"), @import("block_prefill_attn.zig"), @import("block_prefill_emit.zig"), @import("block_prefill_mhc.zig"), @import("block_prefill_moe.zig"), @import("block_prefill_select.zig"), @import("forward_prefill.zig"), @import("forward_prefill_finish.zig"), @import("forward_prefill_glue.zig"), @import("forward_prefill_k4.zig"), @import("gm2pf.zig"), @import("longpf.zig"), @import("calls_check.zig"), @import("rowmode.zig"), @import("serve_knobs.zig") }) |t| std.testing.refAllDecls(t);
+    _ = @import("ced.zig"); // CED's keep and the drafter hand-off
+    _ = @import("image_opts.zig"); // image prompts' block options
+    _ = @import("rowtab.zig"); // row mode's per-row table
+    _ = @import("multi_test.zig"); // several slots' prompt segments in one call
+    _ = @import("streamrb_test.zig"); // the stream top-k's read-back twins on the prefill emitter
     // prepared weight folders (TF_DSV41_PREPARED)
     _ = @import("prepared.zig");
 }

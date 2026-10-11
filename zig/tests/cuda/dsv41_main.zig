@@ -8,6 +8,8 @@ const experts = @import("deepseek_v41/experts.zig");
 const replay_case = @import("deepseek_v41/replay.zig");
 const kvglue = @import("deepseek_v41/kv_glue.zig");
 const kvsplit = @import("deepseek_v41/kvsplit.zig");
+const mhcdec = @import("deepseek_v41/mhcdec.zig");
+const mhc_probe = @import("deepseek_v41/mhc_probe.zig");
 
 const usage =
     \\usage: tf-dsv41-test <command> [fixture dir]
@@ -17,6 +19,7 @@ const usage =
     \\  replay <dir>       one recorded Python extension call (dsv41_capture.py) re-issued and compared, storage by storage
     \\  kvglue <dir>       fused KV RMS/SWA store against the reference Triton bytes
     \\  kvsplit            split KV's exchange copies against kv/split.zig's host reference (no fixture)
+    \\  mhc-probe [windows]  the 16-row mHC boundary under cache states, buffer layouts and a cross-stream dependency
     \\  all <fixtures>     every case directory under <fixtures> by its manifest's "kind"
     \\
 ;
@@ -62,6 +65,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     }
     if (std.mem.eql(u8, cmd, "kvsplit")) return kvsplit.run(gpu, &k);
     if (std.mem.eql(u8, cmd, "kvglue")) return kvglue.run(gpu, &k, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "mhc-probe")) return mhc_probe.run(gpu, &k, if (rest.len > 0) rest[0] else null);
     if (std.mem.eql(u8, cmd, "all")) return all(gpu, &k, try arg(rest, 0));
     std.debug.print("{s}", .{usage});
     return error.UnknownCommand;
@@ -109,6 +113,10 @@ fn all(gpu: check.Gpu, k: *const dsv41.Kernels, root: []const u8) !void {
             experts.glueCases(gpu, k, path)
         else if (std.mem.eql(u8, kind.slice(), "kvglue"))
             kvglue.run(gpu, k, path)
+        else if (std.mem.eql(u8, kind.slice(), "pfglue"))
+            experts.pfglueCases(gpu, k, path)
+        else if (std.mem.eql(u8, kind.slice(), "mhcdec"))
+            mhcdec.cases(gpu, k, path)
         else if (std.mem.eql(u8, kind.slice(), "replay")) blk: {
             const o = replay_case.run(gpu, k, path) catch |e| break :blk e;
             if (o == .skipped) {

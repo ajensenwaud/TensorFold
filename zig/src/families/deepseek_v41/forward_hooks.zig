@@ -41,10 +41,12 @@ pub const RoundGraph = struct {
 /// greedy.zig: the host's best column of a row.
 pub const Greedy = struct { argmax: *const fn (vals: []const f32) usize };
 
-/// vision_rows.zig: rank 0's image rows (`Forward.vision`), and the check that a window holds no image id.
+/// vision_rows.zig: rank 0's image rows (`Forward.vision`), the no-image window check and the prefill's image glue.
 pub const Vision = struct {
     fill: *const fn (v: *anyopaque, s: cuda.Stream, ids: []const u32, rows: u64, D: usize) anyerror!void,
     checkWindow: *const fn (ids: []const u32) anyerror!void,
+    keep: *const fn (f: *Forward, r: *run.Runner, c: *const calls.Call) anyerror!void, // glue image_keep
+    split: *const fn (f: *Forward, r: *run.Runner, c: *const calls.Call, merge: bool) anyerror!void, // or image_merge
 };
 
 /// branches.zig: the runner's side streams (`Forward.branches`) released.
@@ -86,4 +88,8 @@ pub fn roundGraph() !*const RoundGraph {
 
 pub fn greedy() !*const Greedy {
     return set.greedy orelse missing("greedy");
+}
+
+pub fn vision() !*const Vision {
+    return set.vision orelse missing("vision");
 }

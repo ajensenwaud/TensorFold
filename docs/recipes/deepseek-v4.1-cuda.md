@@ -37,3 +37,5 @@ Paths under `zig/src/families/deepseek_v41/`. Host suites (`zig build test-dsv41
   that `tf-dsv41-test all DIR` and `tf-dsv41-test replay DIR` compare on a GPU.
 - `kv/sched_golden.json`, `kv/session_slots_golden.json`, `kv/session_slots_split_golden.json`: the scheduler and
   session slots against the reference (`kv/sched_test.zig`, `kv/session_slots_test.zig`; `zig build test-kv`).
+- `fixtures/dense-k2.txt`, `fixtures/expert-k2.txt`: the K2 width listings the emitters and plans are tested on;
+  `fixtures/chain-op-cap16.json`: the drafting chain's op cap (`slot_drafts_chain_test.zig`).

@@ -1,4 +1,4 @@
-//! Bit checks of the pointwise, glue, top-k keys and x3gm plan kernels against torch.
+//! Bit checks of the pointwise, glue, prefill glue, top-k keys and x3gm plan kernels against torch.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -137,6 +137,112 @@ pub fn glueCases(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
         try check.sameBytes("glue positions", got, pw[1]);
     }
     check.pass("BITEXACT glue.cu == torch: embed send / sum (W {d}), cast_bf16, kit_weights, kit_logits, gather_cols, carry, positions (host and device start), widen_f32", .{W});
+}
+
+/// prefill_glue.cu against torch: block_prefill.zig's glue steps (picks, masks, casts, projections, ring copies).
+pub fn pfglueCases(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
+    var fx = try Fixture.open(gpu.gpa, gpu.io, dir);
+    defer fx.deinit();
+    var b: Bufs = .{ .gpu = gpu, .fx = &fx };
+    defer b.deinit();
+    var stream = try cuda.Stream.init(gpu.d, false); // blocking: ordered after the uploads on the default stream
+    defer stream.deinit();
+    const o = k.others(stream);
+    var nb: [64]u8 = undefined;
+    var nb2: [64]u8 = undefined;
+
+    const ntp = try size(fx, "tp");
+    for (0..ntp) |i| {
+        const R = try size(fx, try std.fmt.bufPrint(&nb, "tp{d}_R", .{i}));
+        const n = try size(fx, try std.fmt.bufPrint(&nb, "tp{d}_n", .{i}));
+        const count = try size(fx, try std.fmt.bufPrint(&nb, "tp{d}_count", .{i}));
+        const keys = try b.up(try std.fmt.bufPrint(&nb, "tp{d}_keys", .{i}));
+        const got = try b.zeros(R * count * 4, 0xee);
+        try o.topPositions(keys.ptr, n, R, n, count, got.ptr);
+        try stream.synchronize();
+        try same(gpu, fx, got, try std.fmt.bufPrint(&nb, "tp{d}_want", .{i}), try std.fmt.bufPrint(&nb2, "pfglue top_positions {d}", .{i}));
+    }
+    {
+        const R = try size(fx, "ck_R");
+        const cnb = try size(fx, "ck_nb");
+        const bs = try size(fx, "ck_bs");
+        const blocks = try b.up("ck_blocks");
+        const got = try b.zeros(R * cnb * bs * 4, 0xee);
+        try o.candKeys(blocks.ptr, cnb, R, cnb, bs, got.ptr);
+        try stream.synchronize();
+        try same(gpu, fx, got, "ck_want", "pfglue candidate_keys");
+    }
+    {
+        const sel = try b.up("tp0_want");
+        const pos = try b.up("vc_pos");
+        const R = try size(fx, "tp0_R");
+        const K = try size(fx, "tp0_count");
+        for ([_]u32{ 4, 128 }) |ratio| {
+            const got = try b.zeros(R * 4, 0xee);
+            try o.visibleCounts(sel.ptr, K, pos.ptr, ratio, R, got.ptr);
+            try stream.synchronize();
+            try same(gpu, fx, got, try std.fmt.bufPrint(&nb, "vc{d}_want", .{ratio}), "pfglue visible_counts");
+        }
+    }
+    {
+        const n = try size(fx, "gp_n");
+        const ld = try size(fx, "gp_slots");
+        const topk = try size(fx, "gp_topk");
+        const pick = try b.up("gp_pick");
+        const wts = try b.up("gp_wts");
+        const pk = try b.zeros(n * topk * 4, 0xee);
+        const w6 = try b.zeros(n * topk * 4, 0xee);
+        try o.gmPicks(pick.ptr, wts.ptr, ld, topk, n, pk.ptr, w6.ptr);
+        try stream.synchronize();
+        try same(gpu, fx, pk, "gp_pk", "pfglue gm_picks picks");
+        try same(gpu, fx, w6, "gp_w6", "pfglue gm_picks kit weights");
+    }
+    {
+        const E = try size(fx, "wm_E");
+        const P = try size(fx, "wm_P");
+        const pick = try b.up("wm_pick");
+        const tab = try b.up("wm_tab");
+        for ([_]u32{ 4, 10 }) |k2| {
+            const got = try b.zeros(P * 4, 0xee);
+            try o.widthMask(pick.ptr, P, tab.ptr, E, k2, got.ptr);
+            try stream.synchronize();
+            try same(gpu, fx, got, try std.fmt.bufPrint(&nb, "wm{d}_want", .{k2}), "pfglue width mask");
+        }
+    }
+    {
+        const x = try b.up("f64_in");
+        const n = x.len / 8;
+        const got = try b.zeros(n * 4, 0xee);
+        try o.f64Bf16F32(x.ptr, got.ptr, n);
+        try stream.synchronize();
+        try same(gpu, fx, got, "f64_want", "pfglue fp64 -> bf16 -> fp32");
+    }
+    {
+        const n = try size(fx, "pj_n");
+        const hd = try size(fx, "pj_hd");
+        const kv = try b.up("pj_kv");
+        const gate = try b.up("pj_gate");
+        const two = try b.zeros(n * 2 * hd * 4, 0xee);
+        try o.widenCat(kv.ptr, gate.ptr, n, hd, two.ptr);
+        const one = try b.zeros(n * hd * 4, 0xee);
+        try o.widenCat(kv.ptr, 0, n, hd, one.ptr);
+        try stream.synchronize();
+        try same(gpu, fx, two, "pj_two", "pfglue projection [kv | gate]");
+        try same(gpu, fx, one, "pj_one", "pfglue projection kv");
+    }
+    for (0..2) |i| {
+        const sr = try size(fx, try std.fmt.bufPrint(&nb, "rc{d}_sr", .{i}));
+        const dr = try size(fx, try std.fmt.bufPrint(&nb, "rc{d}_dr", .{i}));
+        const rb = try size(fx, try std.fmt.bufPrint(&nb, "rc{d}_rb", .{i}));
+        const lo: u64 = @intCast(try fx.int(try std.fmt.bufPrint(&nb, "rc{d}_lo", .{i})));
+        const hi: u64 = @intCast(try fx.int(try std.fmt.bufPrint(&nb, "rc{d}_hi", .{i})));
+        const src = try b.up(try std.fmt.bufPrint(&nb, "rc{d}_src", .{i}));
+        const dst = try b.up(try std.fmt.bufPrint(&nb, "rc{d}_dst", .{i}));
+        try o.ringCopy(src.ptr, sr, dst.ptr, dr, rb, lo, hi);
+        try stream.synchronize();
+        try same(gpu, fx, dst, try std.fmt.bufPrint(&nb, "rc{d}_want", .{i}), "pfglue staging ring copy");
+    }
+    check.pass("BITEXACT prefill_glue.cu == torch: top_positions ({d} shapes, counts 512 / 2,048), candidate_keys, visible_counts, gm_picks, width mask, fp64 casts, projection, ring copies", .{ntp});
 }
 
 /// topk_keys.cu against pick.top (torch.topk on pick.keys) at k 1 / 5 / 64 / 1,024 over 64,640 columns.

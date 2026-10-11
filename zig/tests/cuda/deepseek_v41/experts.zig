@@ -435,6 +435,7 @@ pub fn x3gm(gpu: Gpu, k: *const dsv41.Kernels, dir: []const u8) !void {
 
 pub const pointwiseCases = experts_cases.pointwiseCases;
 pub const glueCases = experts_cases.glueCases;
+pub const pfglueCases = experts_cases.pfglueCases;
 pub const topkCases = experts_cases.topkCases;
 pub const planCases = experts_cases.planCases;
 
