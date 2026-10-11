@@ -3,6 +3,7 @@
 const std = @import("std");
 const tp = @import("tp.zig");
 const kv = @import("kv.zig");
+const sampling = @import("sampling.zig");
 
 /// The backend-neutral core (the safetensors reader the pack headers use) for the family's host side.
 fn core(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
@@ -51,6 +52,10 @@ fn rooted(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     const tp_module = tp.module(b, target, optimize, cuda);
     m.addImport("tp", tp_module);
     m.addImport("kv", kv.module(b, target, optimize, cuda, tp_module));
+    // the lane core's sampling types, shared with the serving module's exact sampler
+    const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    m.addImport("lanes", lanes);
+    m.addImport("dsv41_serve", sampling.serveModule(b, target, optimize, lanes));
     return m;
 }
 

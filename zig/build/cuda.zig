@@ -126,6 +126,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("nemotron", mods.nemotron);
     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
     b.installArtifact(@import("dsv41.zig").runner(b, target, optimize, cuda, strip));
+    @import("sampling.zig").gpu(b, target, optimize, cuda, @import("dsv41.zig").kernels(b, target, optimize, cuda)); // tf-dsv41-samp: the keyed sampler's device steps
     nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.tokenizer, build_options, true).root_module.strip = strip;
 }
 

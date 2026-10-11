@@ -39,3 +39,5 @@ Paths under `zig/src/families/deepseek_v41/`. Host suites (`zig build test-dsv41
   session slots against the reference (`kv/sched_test.zig`, `kv/session_slots_test.zig`; `zig build test-kv`).
 - `fixtures/dense-k2.txt`, `fixtures/expert-k2.txt`: the K2 width listings the emitters and plans are tested on;
   `fixtures/chain-op-cap16.json`: the drafting chain's op cap (`slot_drafts_chain_test.zig`).
+- `fixtures/serve/sampling.jsonl`: keyed sampling against the reference rule (`serve/golden_test.zig`;
+  `zig build test-dsv41-sampling`).

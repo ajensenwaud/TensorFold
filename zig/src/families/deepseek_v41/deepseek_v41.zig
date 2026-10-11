@@ -44,6 +44,8 @@ test {
     _ = @import("rowtab.zig"); // row mode's per-row table
     _ = @import("multi_test.zig"); // several slots' prompt segments in one call
     _ = @import("streamrb_test.zig"); // the stream top-k's read-back twins on the prefill emitter
+    // the keyed sampler's pipeline and device steps (TF_DSV41_SAMPLING; its golden runs in test-dsv41-sampling)
+    inline for (.{ @import("sampling_pipe.zig"), @import("sampling_dev.zig"), @import("sampling_gpu.zig") }) |t| std.testing.refAllDecls(t);
     // prepared weight folders (TF_DSV41_PREPARED)
     _ = @import("prepared.zig");
 }
