@@ -3,11 +3,10 @@
 const std = @import("std");
 const tp = @import("tp.zig");
 const kv = @import("kv.zig");
-const sampling = @import("sampling.zig");
+const server_build = @import("server.zig");
 
 /// The backend-neutral core (the safetensors reader the pack headers use) for the family's host side.
-fn core(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
+fn core(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, tokenizer: *std.Build.Module) *std.Build.Module {
     const m = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     m.addImport("tokenizer", tokenizer);
     return m;
@@ -46,7 +45,9 @@ pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 fn rooted(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, file: []const u8) *std.Build.Module {
     const m = b.createModule(.{ .root_source_file = b.path(b.fmt("zig/src/families/deepseek_v41/{s}", .{file})), .target = target, .optimize = optimize, .link_libc = true });
     const cuda = runtime(b, target, optimize);
-    m.addImport("core", core(b, target, optimize));
+    // one tokenizer module for the core and the serving module
+    const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    m.addImport("core", core(b, target, optimize, tokenizer));
     m.addImport("cuda", cuda);
     m.addImport("dsv41_kernels", kernels(b, target, optimize, cuda));
     const tp_module = tp.module(b, target, optimize, cuda);
@@ -55,7 +56,7 @@ fn rooted(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     // the lane core's sampling types, shared with the serving module's exact sampler
     const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = optimize, .link_libc = true });
     m.addImport("lanes", lanes);
-    m.addImport("dsv41_serve", sampling.serveModule(b, target, optimize, lanes));
+    m.addImport("dsv41_serve", server_build.family(b, target, optimize, tokenizer, lanes).serve);
     return m;
 }
 

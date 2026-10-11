@@ -3,6 +3,7 @@
 const std = @import("std");
 const tp_build = @import("tp.zig");
 const dsv41_build = @import("dsv41.zig");
+const server_build = @import("server.zig");
 
 /// The CUDA runtime without the engine's kernels (tp's in-process ranks need only its types).
 fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
@@ -14,25 +15,11 @@ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     return cuda;
 }
 
-/// The family's serving module (`dsv41_serve`: the exact sampler and its golden) over `lanes`.
-pub fn serveModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, lanes: *std.Build.Module) *std.Build.Module {
-    const fixtures = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/fixtures/serve/fixtures.zig"), .target = target, .optimize = optimize });
-    return b.createModule(.{
-        .root_source_file = b.path("zig/src/families/deepseek_v41/serve/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{
-            .{ .name = "lanes", .module = lanes },
-            .{ .name = "dsv41_serve_fixtures", .module = fixtures },
-        },
-    });
-}
-
-/// The family's serving module (the exact sampler) with the modules it needs, over `lanes`.
-pub fn serve(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, lanes: *std.Build.Module) struct { serve: *std.Build.Module, json: *std.Build.Module } {
-    const json = b.createModule(.{ .root_source_file = b.path("zig/src/server/json.zig"), .target = target, .optimize = optimize });
-    return .{ .serve = serveModule(b, target, optimize, lanes), .json = json };
+/// The family's serving module with its own `json` and `tokenizer`, over `lanes`.
+fn serve(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, lanes: *std.Build.Module) struct { serve: *std.Build.Module, json: *std.Build.Module } {
+    const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    const s = server_build.family(b, target, optimize, tokenizer, lanes);
+    return .{ .serve = s.serve, .json = s.json };
 }
 
 pub fn add(b: *std.Build, test_step: *std.Build.Step) void {
@@ -52,8 +39,8 @@ pub fn add(b: *std.Build, test_step: *std.Build.Step) void {
         },
     });
     const step = b.step("test-dsv41-sampling", "DeepSeek-V4.1's keyed sampling pipeline on in-process ranks vs the Python engine's choices (no GPU)");
-    // the pipeline over the golden, and the serving module's own tests (the host rule)
-    for ([_]*std.Build.Module{ m, s.serve }) |root| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = root })).step);
+    // the pipeline over the golden (the serving module's own tests run in test-dsv41-serve)
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     test_step.dependOn(step);
     // tf-dsv41-samp compiles on any host; running it needs a GPU and the sampling image
     const rt = runtime(b, host, .debug);

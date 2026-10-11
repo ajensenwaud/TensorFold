@@ -1,7 +1,7 @@
 //! A submitted reply's collection: the engine's events in, streamed deltas and the finished ``Reply`` out.
 const std = @import("std");
 const api = @import("engine_api");
-const json = @import("json.zig");
+const json = @import("json");
 const errors = @import("errors.zig");
 const reply_text = @import("reply_text.zig");
 const tool_stream = @import("tool_stream.zig");

@@ -1,6 +1,6 @@
 //! A model family's own chat rules (prompt encoding, effort budgets, call markup) in place of the chat template.
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const errors = @import("errors.zig");
 const Value = json.Value;
 const Cx = errors.Cx;

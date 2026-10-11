@@ -161,6 +161,7 @@ fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
         .imports = &.{ .{ .name = "engine_api", .module = m.api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template }, .{ .name = "native_engines", .module = m.engines }, .{ .name = "checkpoint_cli", .module = checkpointCli(b, target, .ReleaseSafe, null, m.engines) } },
     }) });
     exe.root_module.addOptions("build_options", build_options);
+    _ = @import("server.zig").addTo(b, exe.root_module, target, .ReleaseSafe, tokenizer, lanes); // json, the family's text side
     if (!install_native) {
         exe.root_module.strip = true;
         return exe;
@@ -189,9 +190,16 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
         .link_libc = true,
         .imports = &.{ .{ .name = "engine_api", .module = native_modules.api }, .{ .name = "tokenizer", .module = mods.tokenizer }, .{ .name = "template", .module = template } },
     });
+    const server_json = @import("server.zig").addTo(b, server_tests, host, .debug, mods.tokenizer, mods.lanes);
     const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
-    step.dependOn(&server_test.step);
-    b.step("test-server-cpu", "The HTTP server's unit tests (routes, templates, tool parsing) without a GPU").dependOn(&server_test.step);
+    const json_test = b.addRunArtifact(b.addTest(.{ .root_module = server_json }));
+    const server_step = b.step("test-server-cpu", "The HTTP server's unit tests (routes, templates, tool parsing) without a GPU");
+    for ([_]*std.Build.Step.Run{ server_test, json_test }) |run| {
+        step.dependOn(&run.step);
+        server_step.dependOn(&run.step);
+    }
+    // tensorfold-native's own root (main.zig) compiles here too: only `native` builds it otherwise
+    step.dependOn(&nativeServer(b, host, .debug, cuda, mods.lanes, mods.nemotron, mods.tokenizer, build_options, false).step);
     for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
     cli.addImport("cuda", cuda);

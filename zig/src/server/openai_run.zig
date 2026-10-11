@@ -1,6 +1,6 @@
 //! One OpenAI request's run: the reply generated, then sent whole or streamed as chunks.
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const errors = @import("errors.zig");
 const chat = @import("chat.zig");
 const compact = @import("compact.zig");

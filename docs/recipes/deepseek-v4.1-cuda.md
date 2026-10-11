@@ -44,3 +44,8 @@ Paths under `zig/src/families/deepseek_v41/`. Host suites (`zig build test-dsv41
 - `draft/fixtures/{golden,calib-golden,calib-measure-golden,lookup-golden,spec-golden}.json`: drafting depth,
   calibration, lookup and speculation against the reference engine's traces (`draft/*_test.zig`;
   `zig build test-dsv41-draft`).
+- `fixtures/serve/template.jsonl`, `dsml.jsonl`, `mini_tokenizer.json`: chat encoding, DSML tool calls and the
+  server's family paths (`serve/golden_test.zig` in `zig build test-dsv41-serve`; `server/deepseek_test.zig` and
+  `server/deepseek_wire_test.zig` in the server tests).
+  The release tokenizer's golden corpus is not stored: that test skips without `TF_DSV41_MODEL` and
+  `TF_DSV41_GOLDEN`, an external receipt.
