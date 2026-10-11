@@ -35,3 +35,5 @@ Paths under `zig/src/families/deepseek_v41/`. Host suites (`zig build test-dsv41
   `engram_rows_test.zig`).
 - Not stored: the device kernel fixtures (`cuda_tests/oracle.py`, `cuda_tests/dsv41_capture.py` in the tools)
   that `tf-dsv41-test all DIR` and `tf-dsv41-test replay DIR` compare on a GPU.
+- `kv/sched_golden.json`, `kv/session_slots_golden.json`, `kv/session_slots_split_golden.json`: the scheduler and
+  session slots against the reference (`kv/sched_test.zig`, `kv/session_slots_test.zig`; `zig build test-kv`).
