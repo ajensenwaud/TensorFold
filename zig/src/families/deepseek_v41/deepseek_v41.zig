@@ -12,6 +12,7 @@ pub const plan = @import("plan.zig");
 pub const Plan = plan.Plan;
 pub const stage = @import("stage.zig");
 pub const named = @import("named.zig");
+pub const rounds = @import("rounds.zig");
 pub const prepare = @import("prepare.zig");
 pub const engram_host = @import("engram_host.zig");
 
@@ -48,6 +49,15 @@ test {
     inline for (.{ @import("sampling_pipe.zig"), @import("sampling_dev.zig"), @import("sampling_gpu.zig") }) |t| std.testing.refAllDecls(t);
     // DSpark's pass on the GPU (one slot; several slots' statics and messages): compiled on the host
     inline for (.{ @import("dspark_dev.zig"), @import("dspark_emit.zig"), @import("dspark_gpu.zig"), @import("dspark_gpu_device.zig"), @import("dspark_layout.zig"), @import("dspark_rows.zig") }) |t| std.testing.refAllDecls(t);
+    // batched rows: the batch over several slots, its graphs and target, DSpark over several slots, sessions on the GPU
+    inline for (.{ @import("batch.zig"), @import("batch_engram.zig"), @import("batch_graph.zig"), @import("batch_prof.zig"), @import("batch_target.zig"), @import("slots.zig"), @import("target.zig"), @import("sessions_gpu.zig"), @import("dspark_slots.zig"), @import("dspark_slots_device.zig"), @import("dspark_slots_ingest.zig"), @import("gate_lanes.zig") }) |t| std.testing.refAllDecls(t);
+    _ = rounds; // a round's admit and ids on the plan link
+    _ = @import("lockstep.zig"); // the ranks' lockstep checks
+    _ = @import("round_graph.zig"); // the round's launches (TF_DSV41_ROUND_GRAPH)
+    // DSpark's ingest and passes in the emitted calls: CED, the index bound and the epilogue loads
+    _ = @import("ced_test.zig");
+    _ = @import("ibound_test.zig");
+    _ = @import("x3ld_epi_test.zig");
     // prepared weight folders (TF_DSV41_PREPARED)
     _ = @import("prepared.zig");
 }
