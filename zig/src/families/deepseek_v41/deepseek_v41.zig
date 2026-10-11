@@ -60,4 +60,9 @@ test {
     _ = @import("x3ld_epi_test.zig");
     // prepared weight folders (TF_DSV41_PREPARED)
     _ = @import("prepared.zig");
+    // the served engine, its knobs, hooks, round planner and calibration, and the tool's checks: compiled on the host
+    inline for (.{ @import("model.zig"), @import("engine_hooks.zig"), @import("serve_knobs_apply.zig"), @import("serve_engine.zig"), @import("serve_cli.zig"), @import("sched_host.zig"), @import("calib_gpu.zig"), @import("phases_timed.zig"), @import("session_slots_cli.zig"), @import("slots_cli.zig"), @import("slot_drafts_cli.zig"), @import("tool_main.zig"), @import("gate_layers.zig"), @import("gate_replay.zig"), @import("gate_forward.zig"), @import("gate_kv.zig"), @import("kv_emit_check.zig"), @import("engram_probe.zig") }) |t| std.testing.refAllDecls(t);
+    _ = @import("aot_needs.zig"); // the AOT variants the served config launches (and its test)
+    _ = @import("aot_trace.zig"); // TF_DSV41_AOT_TRACE onto the AOT set
+    _ = @import("boot_mem.zig"); // boot's memory figures and the rope upload
 }

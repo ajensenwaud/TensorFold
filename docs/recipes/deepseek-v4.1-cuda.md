@@ -49,3 +49,4 @@ Paths under `zig/src/families/deepseek_v41/`. Host suites (`zig build test-dsv41
   `server/deepseek_wire_test.zig` in the server tests).
   The release tokenizer's golden corpus is not stored: that test skips without `TF_DSV41_MODEL` and
   `TF_DSV41_GOLDEN`, an external receipt.
+- `tf-dsv41 --help` names the tools by `recipe/<path>`, short for the pinned folder above.

@@ -182,7 +182,7 @@ pub const SlotPass = struct {
                     const ch = try dsd.Chain.init(gpa, r, n, nslots, c, f.cfg.hidden, one.conf != null);
                     errdefer ch.deinit();
                     if (try ch.probe(r, f.cfg, f.widths, f.opts)) |S| {
-                        std.log.err("draft chain: TF_DSV41_DRAFT_CHAIN=1, but the AOT set has no _chain variant for {d} slot(s) (N {d}, KP {d}, candidates {d}, confidence head {}): merge a fill that holds it (tf-dsv41-m1 aot-needs lists it, recipe/triton_fill.py compile), or set TF_DSV41_DRAFT_CHAIN=0", .{ S, n, emit.chain_kp, c, one.conf != null });
+                        std.log.err("draft chain: TF_DSV41_DRAFT_CHAIN=1, but the AOT set has no _chain variant for {d} slot(s) (N {d}, KP {d}, candidates {d}, confidence head {}): merge a fill that holds it (tf-dsv41 aot-needs lists it, recipe/triton_fill.py compile), or set TF_DSV41_DRAFT_CHAIN=0", .{ S, n, emit.chain_kp, c, one.conf != null });
                         return error.MissingChainVariant;
                     }
                     x.dev.?.chain = ch;

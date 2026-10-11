@@ -43,8 +43,12 @@ pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 
 /// The family's sources with their imports, rooted at `file` (a file of zig/src/families/deepseek_v41).
 fn rooted(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, file: []const u8) *std.Build.Module {
+    return over(b, target, optimize, file, runtime(b, target, optimize));
+}
+
+/// The family's sources rooted at `file` over the given CUDA runtime (host-only kernel bindings).
+fn over(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, file: []const u8, cuda: *std.Build.Module) *std.Build.Module {
     const m = b.createModule(.{ .root_source_file = b.path(b.fmt("zig/src/families/deepseek_v41/{s}", .{file})), .target = target, .optimize = optimize, .link_libc = true });
-    const cuda = runtime(b, target, optimize);
     // one tokenizer module for the core and the serving module
     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
     m.addImport("core", core(b, target, optimize, tokenizer));
@@ -57,7 +61,23 @@ fn rooted(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = optimize, .link_libc = true });
     m.addImport("lanes", lanes);
     m.addImport("dsv41_serve", server_build.family(b, target, optimize, tokenizer, lanes).serve);
+    // the served engine: the server's engine seam over the same lanes, and the tokenizer for calibration text
+    m.addImport("engine_api", b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} }));
+    m.addImport("tokenizer", tokenizer);
     return m;
+}
+
+/// `tf-dsv41` (tool_main.zig): replay, host checks, GPU checks and the served engine without HTTP, over `cuda`.
+pub fn tool(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, strip: bool) *std.Build.Step.Compile {
+    const m = over(b, target, optimize, "tool_main.zig", cuda);
+    m.strip = strip;
+    return b.addExecutable(.{ .name = "tf-dsv41", .root_module = m });
+}
+
+/// `tensorfold-dsv41`: the native server with the family's engine (serve_engine.zig) on rank 0, over `cuda`.
+pub fn server(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, build_options: *std.Build.Step.Options) *std.Build.Step.Compile {
+    const engine = over(b, target, optimize, "serve_engine.zig", cuda);
+    return server_build.withEngine(b, target, engine, build_options, "tensorfold-dsv41");
 }
 
 /// `tf-dsv41-test`, the device test runner (zig/tests/cuda/dsv41_main.zig), over `cuda` and host-only family kernels.
@@ -101,4 +121,11 @@ pub fn add(b: *std.Build, test_step: *std.Build.Step) void {
     const compiled = &runner(b, host, .debug, runtime(b, host, .debug), false).step;
     step.dependOn(compiled);
     test_step.dependOn(compiled);
+    // the tool and the family's server compile on any host too; running them needs a GPU, the images and a pack
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", @import("../../build.zig.zon").version);
+    for ([_]*std.Build.Step.Compile{ tool(b, host, .debug, runtime(b, host, .debug), false), server(b, host, .debug, runtime(b, host, .debug), options) }) |c| {
+        step.dependOn(&c.step);
+        test_step.dependOn(&c.step);
+    }
 }
