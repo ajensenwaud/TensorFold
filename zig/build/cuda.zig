@@ -103,6 +103,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("gemma4_cuda", @import("gemma4_cuda.zig").module(b, target, optimize, cuda, mods.core, mods.lanes));
     const runner_exe = b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner });
     b.installArtifact(runner_exe);
+    @import("mimo.zig").tool(b, @import("mimo.zig").module(b, target, optimize, cuda, mods.core, mods.lanes), strip); // tf-mimo: rank 1 behind the server and its checks
     // tf-tp-watch-check: the ranks' lines with no GPU or NCCL; a failing or dying rank stops every rank
     b.installArtifact(b.addExecutable(.{ .name = "tf-tp-watch-check", .root_module = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/tp_watch_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{.{ .name = "cuda", .module = cuda }} }) }));
     @import("living_dense.zig").target(b, target, optimize, cuda, mods.qwen35);
@@ -192,6 +193,7 @@ fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
             .{ .name = "kolibri1", .module = kolibri1Module(b, target, optimize, cuda, core, lanes) },
             .{ .name = "gemma4_cuda", .module = @import("gemma4_cuda.zig").module(b, target, optimize, cuda, core, lanes) },
             .{ .name = "dory", .module = @import("dory.zig").module(b, target, optimize, cuda, core, lanes) },
+            .{ .name = "mimo_v2", .module = @import("mimo.zig").module(b, target, optimize, cuda, core, lanes) },
         },
     });
     return .{ .api = api, .engines = mod };
@@ -483,6 +485,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     const glm = glmCuda(b, host, .debug, cuda, mods.core, mods.lanes, mods.heat);
     @import("glm_family_host.zig").steps(b, cuda, glm, mods, step);
     @import("kolibri.zig").host(b, kolibri1Module(b, host, .debug, cuda, mods.core, mods.lanes), native_modules.api, step);
+    @import("mimo.zig").host(b, @import("mimo.zig").module(b, host, .debug, cuda, mods.core, mods.lanes), step);
     @import("gemma4_cuda.zig").host(b, @import("gemma4_cuda.zig").module(b, host, .debug, cuda, mods.core, mods.lanes), step);
     @import("glm_contracts.zig").tests(b, glm, mods.lanes, cuda, mods.core);
     // the shares a GLM-5.3-Flash rank takes (cluster/canon.zig against the Python family's)
