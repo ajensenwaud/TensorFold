@@ -70,6 +70,7 @@ pub const exl3_grouped = @import("exl3_grouped.zig");
 pub const arena = @import("arena.zig");
 pub const pack = @import("pack.zig");
 pub const graph_cache = @import("graph_cache.zig");
+pub const mimo_exl3 = @import("mimo_exl3.zig");
 
 test {
     _ = nccl;
@@ -148,6 +149,7 @@ test {
     _ = exl3.block.experts;
     _ = exl3.block.lin2;
     _ = exl3.block.x3gm;
+    _ = mimo_exl3;
 }
 
 test {
