@@ -113,6 +113,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "mimo_exl3_experts_cb2", .src = "mimo_v2/exl3_experts_cb2", .flags = &.{"-O3"} },
     .{ .name = "mimo_glue", .src = "mimo_v2/glue", .flags = glue }, // torch's embed / add / rope tables, bit for bit
     .{ .name = "mimo_dflash", .src = "mimo_v2/dflash", .flags = glue }, // the DFlash drafter's torch glue
+    .{ .name = "mimo_kv8", .src = "mimo_v2/kv8", .flags = &.{"-O3"} }, // full attention on an 8-bit cache
     .{ .name = "roce_gather", .src = "roce_gather", .flags = &.{"-O3"} }, // b12x's one-shot RoCE all-gather, two ranks
     .{ .name = "drama3_staged_gemv", .flags = glue },
     .{ .name = "drama3", .flags = &.{"-O3"} },

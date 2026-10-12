@@ -17,8 +17,8 @@ pub const default_context: i64 = 131072;
 pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = fwd.DECODE_ROWS;
 
-/// The server's settings: `lanes` (--parallel) is the streams' cache slots.
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, lanes: u32 = 4 };
+/// The server's settings: `lanes` (--parallel) the streams' cache slots, `kv8` (--kv-cache fp8) kv8.zig's cache.
+pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, lanes: u32 = 4, kv8: bool = false };
 pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool, resumed: bool) anyerror!bool;
 
 pub const Loaded = struct {
@@ -33,6 +33,7 @@ pub const Loaded = struct {
     target: *anyopaque, // no prompt cache (no snap_* decls): never read
     learns: ?*anyopaque = null, // no --slide
     learn_bytes: usize = 0,
+    policy: []const u8 = "", // the cache's precision, for /health: kv=fp16 or kv=fp8
 };
 
 /// The acceptance of DFlash drafts at depth 1, 2, ... given the ones before, until a stream has its own.
@@ -351,7 +352,7 @@ const Owned = struct { gpa: std.mem.Allocator, e: *Engine, l: Lanes, session: ?*
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
     const aot_dir = kernels orelse return error.NoCapturedTritonSet; // TENSORFOLD_CUDA_KERNELS
     if (o.lanes == 0 or o.lanes > 16) return error.Slots;
-    const su: engine.Setup = .{ .context = o.context, .slots = o.lanes, .drafts = o.drafts };
+    const su: engine.Setup = .{ .context = o.context, .slots = o.lanes, .drafts = o.drafts, .kv8 = o.kv8 };
     var session: ?*tp.Session = null;
     if (try tpConfig()) |c| if (c.world > 1) {
         if (c.rank != 0) return error.FollowerServes; // rank 1 runs `tf-mimo follow`
@@ -381,6 +382,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .ctx = own,
         .deinit = release,
         .target = own,
+        .policy = if (o.kv8) "kv=fp8" else "kv=fp16",
     };
 }
 
@@ -434,4 +436,9 @@ fn release(p: *anyopaque) void {
         own.gpa.destroy(ss);
     }
     own.gpa.destroy(own);
+}
+
+test "the 16-bit cache is the default; --kv-cache fp8 opts in" {
+    const o: Options = .{ .context = 4096, .drafts = true };
+    try std.testing.expect(!o.kv8);
 }

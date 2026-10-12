@@ -1,4 +1,4 @@
-//! tf-mimo: rank 1 behind the server (follow) and the decode forward against the Python engine's bytes (m1).
+//! tf-mimo: rank 1 behind the server (follow), the decode forward against the Python engine's bytes (m1), kv8check.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -65,14 +65,16 @@ pub fn main(init: std.process.Init) !u8 {
     const cmd: []const u8 = if (args.len >= 2) args[1] else "";
     const is_m1 = args.len >= 5 and std.mem.eql(u8, cmd, "m1");
     const is_follow = args.len >= 4 and std.mem.eql(u8, cmd, "follow");
-    if (!is_m1 and !is_follow) {
+    const is_kv8 = args.len >= 4 and std.mem.eql(u8, cmd, "kv8check");
+    if (!is_m1 and !is_follow and !is_kv8) {
         std.debug.print("usage: tf-mimo m1 MODEL ORACLE(rank<R>.safetensors) AOT_DIR [CONTEXT]\n" ++
-            "       tf-mimo follow MODEL AOT_DIR   (TP rank 1 behind tensorfold-native serve on rank 0)\n", .{});
+            "       tf-mimo follow MODEL AOT_DIR   (TP rank 1 behind tensorfold-native serve on rank 0)\n" ++
+            "       tf-mimo kv8check MODEL AOT_DIR   (the 8-bit cache's decode attention against Triton's)\n", .{});
         return 2;
     }
     const gpa = init.gpa;
     const io = init.io;
-    const context: usize = if (args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 4096;
+    const context: usize = if (is_kv8) 8192 else if (is_m1 and args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 4096;
     const cfg = try tp.Config.fromEnv();
     var driver = try cuda.Driver.open();
     defer driver.close();
@@ -95,12 +97,13 @@ pub fn main(init: std.process.Init) !u8 {
     defer w.deinit();
     var k3 = try cuda.mimo_exl3.Kernels.load(&driver);
     defer k3.deinit();
-    var set = try cuda.aot.Set.load(gpa, io, &driver, ctx.device, args[4]);
+    var set = try cuda.aot.Set.load(gpa, io, &driver, ctx.device, args[if (is_kv8) 3 else 4]);
     defer set.deinit();
     const comm = if (world > 1) session.comm() else null;
-    var model = try mimo.forward.Model.init(gpa, &driver, &w, &set, &k3, comm, context, 1, 1, s);
+    var model = try mimo.forward.Model.init(gpa, &driver, &w, &set, &k3, comm, context, 1, 1, false, s);
     defer model.deinit();
     std.debug.print("[m1] rank {d}: loaded in {d:.0}s ({d:.1} GiB weights)\n", .{ rank, @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e9, @as(f64, @floatFromInt(w.arena.total)) / (1 << 30) });
+    if (is_kv8) return if (try mimo.kv8.check(&model, io, s, rank)) 0 else 1;
 
     var ora = try core.safetensors.File.open(gpa, io, args[3]);
     defer ora.close(io);
@@ -164,7 +167,7 @@ fn follow(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, session: *t
     var buf: std.ArrayList(i64) = .empty;
     defer buf.deinit(gpa);
     const su = try mimo.engine.setupOf(try session.plan.recvGrow(gpa, &buf));
-    std.debug.print("[follow] rank {d}: context {d}, {d} slots, drafter {s}\n", .{ session.cfg.rank, su.context, su.slots, if (su.drafts) "on" else "off" });
+    std.debug.print("[follow] rank {d}: context {d}, {d} slots, drafter {s}, {s} cache\n", .{ session.cfg.rank, su.context, su.slots, if (su.drafts) "on" else "off", if (su.kv8) "8-bit" else "16-bit" });
     const e = try mimo.engine.Engine.init(gpa, io, d, model_dir, aot_dir, su, session);
     defer e.deinit();
     std.debug.print("[follow] loaded; following\n", .{});
