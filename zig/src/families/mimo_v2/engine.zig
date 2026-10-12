@@ -12,17 +12,17 @@ const prompt_mod = @import("prompt.zig");
 pub const Op = enum(i64) { hello = 0x31A0, forward = 1, draft = 2, stop = 3, prompt = 4 };
 
 /// What rank 0 announces first so every rank builds the same model.
-pub const Setup = struct { context: usize, slots: usize, drafts: bool };
+pub const Setup = struct { context: usize, slots: usize, drafts: bool, kv8: bool };
 
-/// The hello words: [hello, 3, context, slots, drafts, 0, 0, 0].
+/// The hello words: [hello, 4, context, slots, drafts, kv8, 0, 0].
 pub fn hello(su: Setup) [8]i64 {
-    return .{ @backingInt(Op.hello), 3, @intCast(su.context), @intCast(su.slots), @intFromBool(su.drafts), 0, 0, 0 };
+    return .{ @backingInt(Op.hello), 4, @intCast(su.context), @intCast(su.slots), @intFromBool(su.drafts), @intFromBool(su.kv8), 0, 0 };
 }
 
 /// The setup a follower reads from rank 0's hello.
 pub fn setupOf(words: []const i64) !Setup {
-    if (words.len < 5 or words[0] != @backingInt(Op.hello)) return error.NoHello;
-    return .{ .context = @intCast(words[2]), .slots = @intCast(words[3]), .drafts = words[4] != 0 };
+    if (words.len < 6 or words[0] != @backingInt(Op.hello)) return error.NoHello;
+    return .{ .context = @intCast(words[2]), .slots = @intCast(words[3]), .drafts = words[4] != 0, .kv8 = words[5] != 0 };
 }
 
 /// The model, its kernels and the TP session: what rank 0 serves and rank 1 follows.
@@ -57,7 +57,7 @@ pub const Engine = struct {
         e.set = try cuda.aot.Set.load(gpa, io, d, 0, aot_dir);
         errdefer e.set.deinit();
         const comm = if (session) |ss| ss.comm() else null;
-        e.model = try fwd.Model.init(gpa, d, &e.w, &e.set, &e.k3, comm, su.context, fwd.DECODE_ROWS, su.slots, e.s);
+        e.model = try fwd.Model.init(gpa, d, &e.w, &e.set, &e.k3, comm, su.context, fwd.DECODE_ROWS, su.slots, su.kv8, e.s);
         errdefer e.model.deinit();
         if (su.drafts) {
             const ddir = try std.fmt.allocPrint(gpa, "{s}/dflash", .{dir});
@@ -167,7 +167,7 @@ pub const Engine = struct {
 };
 
 test "the hello carries the setup" {
-    const su: Setup = .{ .context = 608256, .slots = 4, .drafts = true };
+    const su: Setup = .{ .context = 608256, .slots = 4, .drafts = true, .kv8 = true };
     try std.testing.expectEqual(su, try setupOf(&hello(su)));
     try std.testing.expectError(error.NoHello, setupOf(&.{ 3, 0 }));
 }

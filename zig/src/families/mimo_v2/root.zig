@@ -3,6 +3,7 @@
 pub const config = @import("config.zig");
 pub const load = @import("load.zig");
 pub const forward = @import("forward.zig");
+pub const kv8 = @import("kv8.zig");
 pub const dflash = @import("dflash.zig");
 pub const prompt = @import("prompt.zig");
 pub const engine = @import("engine.zig");
@@ -13,6 +14,7 @@ test {
     _ = config;
     _ = load;
     _ = forward;
+    _ = kv8;
     _ = dflash;
     _ = prompt;
     _ = engine;

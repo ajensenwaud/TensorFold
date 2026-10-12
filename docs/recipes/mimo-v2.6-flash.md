@@ -22,7 +22,7 @@ the two ranks exchange through the tensor-parallel session and RoCE mailbox of h
 The family needs the Python engine's Triton kernels as a captured set (a folder with `aot.json` and the cubins),
 recorded from the Python engine for sm_121 with `tools/zig/triton_aot_manifest.py` and packed with
 `zig/tests/cuda/nemotron/aot_pack.py`. Point `TENSORFOLD_CUDA_KERNELS` at the folder on every rank; without it the
-server refuses the checkpoint (`NoCapturedTritonSet`). EXL3 and the torch glue are built in.
+server refuses the checkpoint (`NoCapturedTritonSet`). EXL3, the torch glue and the 8-bit cache are built in.
 
 ## Two Sparks
 
@@ -45,8 +45,15 @@ comes from its own acceptance rate, priced with a round cost that grows with its
 more run on the prompt path (EXL3 prompt GEMM, the full-attention prompt kernel, experts grouped up to 3,072 rows a
 chunk and per expert beyond); shorter ones run as decode rows.
 
+## Policy
+
+`--policy kv=fp8` keeps the 9 full-attention layers' keys and values in e4m3 with an fp32 scale a token and key
+head, half the bytes a decode step reads at long context. It is not bit-equal to the 16-bit cache; `kv=fp16`, the
+default, is. `/health` shows the active policy.
+
 ## Checks
 
 - `tf-cuda-test mimo-exl3 FILE PREFIX` and `mimo-exl3-fixtures MODEL DIR`: the EXL3 kernels against the format
   reference and against the Python engine's bytes (`zig/tests/cuda/oracle/mimo_exl3_fixtures.py`).
 - `tf-mimo m1 MODEL ORACLE AOT_DIR` on each rank: residuals, logits and argmax byte-equal to the Python engine's.
+- `tf-mimo kv8check MODEL AOT_DIR`: the 8-bit decode attention against Triton's on the same values.

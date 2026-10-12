@@ -5,6 +5,7 @@ const cuda = @import("cuda");
 const tp = @import("tp");
 const load_ = @import("load.zig");
 const dflash = @import("dflash.zig");
+const kv8_ = @import("kv8.zig");
 const exl3 = cuda.exl3;
 const aot = cuda.aot;
 const Weights = load_.Weights;
@@ -93,6 +94,7 @@ pub const Model = struct {
     captures: usize = 0,
     kc: []u64,
     vc: []u64,
+    kv8: ?kv8_.Kv8 = null, // --policy kv=fp8: the full layers' 8-bit cache
     cos_full: u64,
     sin_full: u64,
     cos_swa: u64,
@@ -102,7 +104,7 @@ pub const Model = struct {
     arena: load_.Arena,
     gpa: std.mem.Allocator,
 
-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const Weights, set: *const aot.Set, k3: *const exl3.Kernels, comm: ?tp.Collective, context: usize, rows: usize, slots: usize, s: Stream) !Model {
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const Weights, set: *const aot.Set, k3: *const exl3.Kernels, comm: ?tp.Collective, context: usize, rows: usize, slots: usize, kv8: bool, s: Stream) !Model {
         const cfg = w.cfg;
         var m: Model = undefined;
         m.w = w;
@@ -131,11 +133,14 @@ pub const Model = struct {
         // caches: keys [1, LEN, HK, 192], values [1, LEN, HK, 128], zeroed (forward.Model.__init__)
         m.kc = try gpa.alloc(u64, cfg.layers);
         m.vc = try gpa.alloc(u64, cfg.layers);
+        m.kv8 = if (kv8) try kv8_.Kv8.init(gpa, d, &m.arena, cfg, slots, context) else null;
+        errdefer if (m.kv8) |*k| k.deinit(gpa);
         for (0..cfg.layers) |i| {
             const n = if (cfg.full[i]) context else m.ring;
             const hk = cfg.kvHeads(i);
-            m.kc[i] = try ar.zeros(slots * n * hk * 192 * 2);
-            m.vc[i] = try ar.zeros(slots * n * hk * 128 * 2);
+            const bytes: usize = if (m.kv8 != null and cfg.full[i]) 1 else 2; // e4m3 or fp16
+            m.kc[i] = try ar.zeros(slots * n * hk * 192 * bytes);
+            m.vc[i] = try ar.zeros(slots * n * hk * 128 * bytes);
         }
         // rope tables per theta: cos, sin [context, rope_dim / 2] fp32
         const half = cfg.rope_dim / 2;
@@ -221,6 +226,7 @@ pub const Model = struct {
         m.graphs.deinit(m.gpa);
         m.gpa.free(m.kc);
         m.gpa.free(m.vc);
+        if (m.kv8) |*k| k.deinit(m.gpa);
         m.glue.unload();
         m.arena.deinit();
     }
@@ -388,7 +394,7 @@ pub const Model = struct {
             try m.proj(s, L.q, m.b.x, m.b.q, false, n);
             try m.proj(s, L.k, m.b.x, m.b.k, false, n);
             try m.proj(s, L.v, m.b.x, m.b.v, false, n);
-            try m.attention(s, i, L.sinks, n, chunks);
+            if (cfg.full[i] and m.kv8 != null) try m.kv8.?.attend(m, s, i, n, chunks) else try m.attention(s, i, L.sinks, n, chunks);
             if (cap) |c| if (c.hook) |h| try h(c.ctx, .att, i, m.b.att, n * H * 128 * 2);
             try m.proj(s, L.o, m.b.att, m.b.part, true, n);
             try m.sumNorm(s, m.b.part, L.post_norm, m.b.x, n);
