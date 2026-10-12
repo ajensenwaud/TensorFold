@@ -40,6 +40,7 @@ pub const modelopt = @import("modelopt.zig");
 pub const graph_cache = @import("graph_cache.zig");
 pub const arena = @import("arena.zig");
 pub const pack = @import("pack.zig");
+pub const exl3 = @import("exl3.zig");
 
 test {
     _ = @import("memory.zig");
@@ -62,4 +63,5 @@ test {
     _ = @import("graph_registry.zig");
     _ = arena;
     _ = pack;
+    _ = exl3;
 }
