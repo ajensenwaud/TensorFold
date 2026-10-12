@@ -157,7 +157,7 @@ pub fn probe(e: *Engine) depth.Probe {
 }
 
 pub fn who(s: *Stream) depth.Who {
-    return .{ .state = &s.depth, .draft_room = s.draftRoom(), .finished = s.finished, .forced = s.force.items.len > 0, .granted = s.granted, .stream = s };
+    return .{ .state = &s.depth, .draft_room = s.draftRoom(), .finished = s.finished, .forced = s.force.items.len > 0, .granted = s.granted, .stream = s, .position = s.cache_len };
 }
 
 /// Trim draft prefixes by landing probability to the shared width with the most expected tokens a ms.

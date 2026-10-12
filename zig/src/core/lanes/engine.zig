@@ -69,6 +69,11 @@ pub const Engine = struct {
                 .plain_guard = cfg.plain_guard,
                 .node_probabilities = cfg.node_probabilities,
                 .batch_rows = cfg.batch_rows,
+                .geometric = cfg.geometric_depth,
+                .geo_costs = cfg.geometric_costs,
+                .geo_draft = cfg.geometric_draft_cost,
+                .geo_ctx = cfg.geometric_ctx,
+                .geo_ctx_base = cfg.geometric_ctx_base,
             },
         };
     }
