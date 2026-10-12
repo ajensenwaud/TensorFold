@@ -47,6 +47,7 @@ const kernels = [_]Kernel{
     .{ .name = "mimo_exl3_experts_cb2", .src = "mimo_v2/exl3_experts_cb2", .flags = &.{ "-O3", "-lineinfo" } },
     .{ .name = "mimo_glue", .src = "mimo_v2/glue", .flags = glue }, // torch's embed / add / rope tables, bit for bit
     .{ .name = "mimo_dflash", .src = "mimo_v2/dflash", .flags = glue }, // the DFlash drafter's torch glue
+    .{ .name = "mimo_kv8", .src = "mimo_v2/kv8", .flags = &.{"-O3"} }, // full attention on an 8-bit cache
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.

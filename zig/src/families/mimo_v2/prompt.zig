@@ -77,6 +77,8 @@ pub const Prompt = struct {
     eu: u64,
     eh: u64,
     ed: u64,
+    kd: u64 = 0, // kv8: a full layer's fp16 keys [context, HK, 192] / values for the prompt kernel
+    vd: u64 = 0,
     sc: exl3.Scratch, // the grouped kernel's, for chunks under EXPERTS_FROM rows (in windows of sc.rows)
     taps: u64, // drafter: the chunk's last TOKENS_PER_UPDATE rows' taps
     h_ids: []i64,
@@ -170,6 +172,10 @@ pub const Prompt = struct {
         const sz = exl3.Scratch.bytes(e0, rows_g, K8, cfg_gu, cfg_d);
         pr.sc = .{ .xg = try ar.zeros(sz.xg), .xu = try ar.zeros(sz.xg), .xd = try ar.zeros(sz.xd), .z = try ar.zeros(sz.z), .y = try ar.zeros(sz.y), .ids = try ar.zeros(sz.ids), .count = try ar.zeros(4), .members = try ar.alloc(sz.members), .rows = rows_g, .slots = K8, .cfg_gu = cfg_gu, .cfg_d = cfg_d };
         try m.d.check(m.d.api.cuMemsetD32_v2(pr.sc.members, 0xFFFF_FFFF, sz.members / 4), "members -1");
+        if (m.kv8 != null) {
+            pr.kd = try ar.zeros(m.context * cfg.kv_full * 192 * 2);
+            pr.vd = try ar.zeros(m.context * cfg.kv_full * 128 * 2);
+        }
         pr.taps = if (m.dr) |dr| try ar.zeros(@min(R, TOKENS_PER_UPDATE) * dr.taps.len * D * 2) else 0; // fp16, as the tap buffer
         pr.h_ids = try gpa.alloc(i64, R);
         pr.h_pos = try gpa.alloc(i32, R);
@@ -337,7 +343,7 @@ pub const Prompt = struct {
             try pr.gemm(s, L.v, false, pr.x, pr.v, false, n);
             const full = cfg.full[i];
             const len = if (full) m.context else m.ring;
-            try m.set.run(s, "_qkv", .{ u(n), u(H + 2 * hk), 1 }, &.{
+            if (full and m.kv8 != null) try m.kv8.?.qkv(m, s, i, pr.q, pr.k, pr.v, pr.pos, pr.slot, pr.qo, n) else try m.set.run(s, "_qkv", .{ u(n), u(H + 2 * hk), 1 }, &.{
                 p("Q", "*fp16", pr.q),                                  p("K", "*fp16", pr.k),                                  p("V", "*fp16", pr.v),
                 p("COS", "*fp32", if (full) m.cos_full else m.cos_swa), p("SIN", "*fp32", if (full) m.sin_full else m.sin_swa), p("POS", "*i32", pr.pos),
                 p("SLOT", "*i32", pr.slot),                             p("QO", "*fp16", pr.qo),                                p("KC", "*fp16", m.kc[i]),
@@ -345,9 +351,10 @@ pub const Prompt = struct {
             }, &.{ ci("H", H), ci("HK", hk), ci("RD", cfg.rope_dim) });
             const g = H / hk;
             if (full) {
-                // attention.prompt over the slot's whole cache
-                const kc = m.kc[i] + @as(u64, slot) * m.context * hk * 192 * 2;
-                const vc = m.vc[i] + @as(u64, slot) * m.context * hk * 128 * 2;
+                // attention.prompt over the slot's whole cache (8-bit: its keys so far back to fp16 first)
+                if (m.kv8) |*k8| try k8.dequant(m, s, i, slot, p0 + n, pr.kd, pr.vd);
+                const kc = if (m.kv8 != null) pr.kd else m.kc[i] + @as(u64, slot) * m.context * hk * 192 * 2;
+                const vc = if (m.kv8 != null) pr.vd else m.vc[i] + @as(u64, slot) * m.context * hk * 128 * 2;
                 try m.set.run(s, "_prompt", .{ u((n + PROMPT_BM - 1) / PROMPT_BM), u(hk), 1 }, &.{
                     p("Q", "*fp16", pr.qo), p("KC", "*fp16", kc), p("VC", "*fp16", vc), p("OUT", "*fp16", pr.att),
                     ii("P0", p0),           ii("W", n),

@@ -42,6 +42,7 @@ pub const mimo_exl3_experts: []const u8 = if (available) &Blob("fatbin_mimo_exl3
 pub const mimo_exl3_experts_cb2: []const u8 = if (available) &Blob("fatbin_mimo_exl3_experts_cb2").bytes else &.{};
 pub const mimo_glue: []const u8 = if (available) &Blob("fatbin_mimo_glue").bytes else &.{};
 pub const mimo_dflash: []const u8 = if (available) &Blob("fatbin_mimo_dflash").bytes else &.{};
+pub const mimo_kv8: []const u8 = if (available) &Blob("fatbin_mimo_kv8").bytes else &.{};
 pub const nemotron_norms: []const u8 = if (available) &Blob("fatbin_nemotron_norms").bytes else &.{};
 pub const nemotron_route: []const u8 = if (available) &Blob("fatbin_nemotron_route").bytes else &.{};
 pub const nemotron_mamba: []const u8 = if (available) &Blob("fatbin_nemotron_mamba").bytes else &.{};

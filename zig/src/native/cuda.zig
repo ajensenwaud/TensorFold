@@ -21,6 +21,7 @@ const nemotron_snaps: api.prompt_cache.Snapshots.VTable = .{
 };
 
 pub const backends: []const []const u8 = &.{"cuda"};
+pub const serves: []const []const u8 = &.{"--policy"}; // MiMo-V2: kv=fp8
 pub const families: []const api.Family = blk: {
     var out: [registry.len]api.Family = undefined;
     for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats };
@@ -418,7 +419,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         problem.* = try std.fmt.allocPrint(a, "the checkpoint's {d:.1} GiB of weights do not fit the {d:.1} GiB the CUDA memory budget grants ({d:.1} GiB free less a {d:.1} GiB reserve{s}); free device memory or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB", .{ toGib(weights), toGib(before.room(held0)), toGib(before.free), toGib(before.reserve), if (before.limit != null) ", under TENSORFOLD_CUDA_MEMORY_LIMIT_GB" else "" });
         return null;
     }
-    const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels, if (@hasField(F.Options, "lanes")) .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments, .slide = o.slide, .lanes = o.lanes } else .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments, .slide = o.slide }) catch |e| {
+    const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels, if (@hasField(F.Options, "policy")) .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments, .slide = o.slide, .lanes = o.lanes, .policy = o.policy } else .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments, .slide = o.slide }) catch |e| {
         problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot load {s} with {s} glue kernels ({s})", .{ o.dir, kernels orelse "its own", @errorName(e) });
         return null;
     };
@@ -474,7 +475,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         gpa.free(h.dir);
     };
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
-    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .prompt_cache = h.store != null, .logprobs = loaded.backend.vtable.first_row != null, .structures = loaded.backend.vtable.first_masked != null }, .{ .ctx = loaded.ctx, .text = F.explain });
+    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .policy = if (@hasField(F.Loaded, "policy")) loaded.policy else "", .prompt_cache = h.store != null, .logprobs = loaded.backend.vtable.first_row != null, .structures = loaded.backend.vtable.first_masked != null }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }

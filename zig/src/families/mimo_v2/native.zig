@@ -16,8 +16,8 @@ pub const default_context: i64 = 131072;
 pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = fwd.DECODE_ROWS;
 
-/// The server's settings: `lanes` (--parallel) is the streams' cache slots.
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, lanes: u32 = 4 };
+/// The server's settings: `lanes` (--parallel) is the streams' cache slots, `policy` (--policy) key=value pairs.
+pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, lanes: u32 = 4, policy: []const u8 = "" };
 pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool;
 
 pub const Loaded = struct {
@@ -32,6 +32,29 @@ pub const Loaded = struct {
     target: *anyopaque, // no prompt cache (no snap_* decls): never read
     learns: ?*anyopaque = null, // no --slide
     learn_bytes: usize = 0,
+    policy: []const u8 = "", // the active policy, for /health
+};
+
+/// --policy: `kv=fp16` (the default) or `kv=fp8` (the full layers' 8-bit key/value cache, kv8.zig).
+pub const Policy = struct {
+    kv8: bool = false,
+
+    pub fn parse(text: []const u8) !Policy {
+        var out: Policy = .{};
+        var it = std.mem.tokenizeScalar(u8, text, ',');
+        while (it.next()) |pair| {
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse return error.Policy;
+            const key = std.mem.trim(u8, pair[0..eq], " ");
+            const value = std.mem.trim(u8, pair[eq + 1 ..], " ");
+            if (!std.mem.eql(u8, key, "kv")) return error.Policy;
+            out.kv8 = if (std.mem.eql(u8, value, "fp8")) true else if (std.mem.eql(u8, value, "fp16")) false else return error.Policy;
+        }
+        return out;
+    }
+
+    pub fn line(p: Policy) []const u8 {
+        return if (p.kv8) "kv=fp8" else "kv=fp16";
+    }
 };
 
 /// The acceptance of DFlash drafts at depth 1, 2, ... given the ones before, until a stream has its own.
@@ -350,7 +373,8 @@ const Owned = struct { gpa: std.mem.Allocator, e: *Engine, l: Lanes, session: ?*
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
     const aot_dir = kernels orelse return error.NoCapturedTritonSet; // TENSORFOLD_CUDA_KERNELS
     if (o.lanes == 0 or o.lanes > 16) return error.Slots;
-    const su: engine.Setup = .{ .context = o.context, .slots = o.lanes, .drafts = o.drafts };
+    const policy = try Policy.parse(o.policy);
+    const su: engine.Setup = .{ .context = o.context, .slots = o.lanes, .drafts = o.drafts, .kv8 = policy.kv8 };
     var session: ?*tp.Session = null;
     const cfg = tp.Config.fromEnv() catch null;
     if (cfg) |c| if (c.world > 1) {
@@ -381,6 +405,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .ctx = own,
         .deinit = release,
         .target = own,
+        .policy = policy.line(),
     };
 }
 
@@ -412,4 +437,14 @@ fn release(p: *anyopaque) void {
         own.gpa.destroy(ss);
     }
     own.gpa.destroy(own);
+}
+
+test "policy: kv=fp16 by default, kv=fp8 opts in, anything else is refused" {
+    try std.testing.expect(!(try Policy.parse("")).kv8);
+    try std.testing.expect((try Policy.parse("kv=fp8")).kv8);
+    try std.testing.expect(!(try Policy.parse("kv=fp8,kv=fp16")).kv8);
+    try std.testing.expectEqualStrings("kv=fp8", (try Policy.parse(" kv = fp8 ")).line());
+    try std.testing.expectError(error.Policy, Policy.parse("kv=int4"));
+    try std.testing.expectError(error.Policy, Policy.parse("matrix=off"));
+    try std.testing.expectError(error.Policy, Policy.parse("kv"));
 }
