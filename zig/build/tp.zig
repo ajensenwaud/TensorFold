@@ -39,20 +39,29 @@ fn kernelModule(b: *std.Build, image: ?std.Build.LazyPath) *std.Build.Module {
     return b.createModule(.{ .root_source_file = wf.add("tp_kernel.zig", "pub const mailbox: []const u8 = \"\";\n") });
 }
 
+var mailbox_module: ?*std.Build.Module = null;
+
+/// `tp_kernel`: the mailbox fatbin (-Dtp-nvcc / -Dtp-fatbin, or empty), one module for every runner on RoCE.
+pub fn mailboxModule(b: *std.Build) *std.Build.Module {
+    if (mailbox_module) |m| return m;
+    const nvcc = b.option([]const u8, "tp-nvcc", "nvcc that builds the TP mailbox kernel");
+    const prebuilt = b.option([]const u8, "tp-fatbin", "absolute path of a prebuilt tp_mailbox.fatbin to embed");
+    const image: ?std.Build.LazyPath = if (prebuilt) |p| b.graph.cwdRelativePath(p) else if (nvcc) |tool| mailboxFatbin(b, tool) else null;
+    mailbox_module = kernelModule(b, image);
+    return mailbox_module.?;
+}
+
 pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, test_step: *std.Build.Step) void {
     const host = b.graph.host;
     const tests = b.addRunArtifact(b.addTest(.{ .root_module = module(b, host, .debug, runtime(b, host, .debug)) }));
     b.step("test-tp", "Tensor parallelism's host tests: bootstrap, fate channel, in-process ranks (no GPU)").dependOn(&tests.step);
     test_step.dependOn(&tests.step);
     if (target.result.os.tag != .linux) return;
-    const nvcc = b.option([]const u8, "tp-nvcc", "nvcc that builds the TP mailbox kernel");
-    const prebuilt = b.option([]const u8, "tp-fatbin", "absolute path of a prebuilt tp_mailbox.fatbin to embed");
-    const image: ?std.Build.LazyPath = if (prebuilt) |p| b.graph.cwdRelativePath(p) else if (nvcc) |tool| mailboxFatbin(b, tool) else null;
     const cuda = runtime(b, target, optimize);
     const runner = b.createModule(.{ .root_source_file = b.path("zig/src/fabric/tp/gpu_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     runner.addImport("cuda", cuda);
     runner.addImport("tp", module(b, target, optimize, cuda));
-    runner.addImport("tp_kernel", kernelModule(b, image));
+    runner.addImport("tp_kernel", mailboxModule(b));
     const exe = b.addExecutable(.{ .name = "tf-tp-test", .root_module = runner });
     b.installArtifact(exe);
     b.step("tf-tp-test", "TP=2 on two GPUs: bootstrap, every collective bit-exact, graph capture, fail-fast, latency").dependOn(&b.addInstallArtifact(exe, .{}).step);
