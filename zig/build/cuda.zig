@@ -54,6 +54,8 @@ const kernels = [_]Kernel{
     .{ .name = "mimo_glue", .src = "mimo_v2/glue", .flags = glue }, // torch's embed / add / rope tables, bit for bit
     .{ .name = "mimo_dflash", .src = "mimo_v2/dflash", .flags = glue }, // the DFlash drafter's torch glue
     .{ .name = "mimo_kv8", .src = "mimo_v2/kv8", .flags = &.{"-O3"} }, // full attention on an 8-bit cache
+    .{ .name = "muse_glue", .src = "muse_spark/glue", .flags = glue }, // Muse Spark: norms, gates, router, expert sums, head
+    .{ .name = "muse_attention", .src = "muse_spark/attention", .flags = &.{"-O3"} }, // Muse Spark: head_dim 64 decode attention
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
@@ -152,6 +154,12 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     for ([_][]const u8{ "cuda", "core", "tp", "tp_kernel" }) |name| mimo_exe.addImport(name, mimo.import_table.get(name).?);
     mimo_exe.addImport("mimo_v2", mimo);
     b.installArtifact(b.addExecutable(.{ .name = "tf-mimo", .root_module = mimo_exe }));
+    // tf-muse: Muse Spark's decode forward against exllamav3's answer key
+    const muse = museModule(b, target, optimize, cuda, mimo);
+    const muse_exe = b.createModule(.{ .root_source_file = b.path("zig/src/families/muse_spark/m1_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    muse_exe.addImport("cuda", cuda);
+    muse_exe.addImport("muse_spark", muse);
+    b.installArtifact(b.addExecutable(.{ .name = "tf-muse", .root_module = muse_exe }));
 }
 
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
@@ -176,6 +184,15 @@ fn mimoModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     m.addImport("lanes", lanes);
     m.addImport("tp", @import("tp.zig").module(b, target, optimize, cuda));
     m.addImport("tp_kernel", @import("tp.zig").mailboxModule(b));
+    return m;
+}
+
+/// Muse Spark (families/muse_spark): config, loader and decode forward; it reuses MiMo-V2's EXL3 pack helpers.
+fn museModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, mimo: *std.Build.Module) *std.Build.Module {
+    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/muse_spark/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    m.addImport("cuda", cuda);
+    m.addImport("core", mimo.import_table.get("core").?);
+    m.addImport("mimo_v2", mimo);
     return m;
 }
 
@@ -240,6 +257,9 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     const mimo_test = b.addRunArtifact(b.addTest(.{ .root_module = mimo }));
     step.dependOn(&mimo_test.step);
     b.step("test-mimo", "MiMo-V2 family host tests").dependOn(&mimo_test.step);
+    const muse_test = b.addRunArtifact(b.addTest(.{ .root_module = museModule(b, host, .debug, cuda, mimo) }));
+    step.dependOn(&muse_test.step);
+    b.step("test-muse", "Muse Spark family host tests").dependOn(&muse_test.step);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);
