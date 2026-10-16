@@ -95,8 +95,10 @@ fn argmax(xs: []const f32) i32 {
 
 pub fn main(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "follow")) return follow(init.gpa, init.io, args[2]);
     if (args.len < 5 or !std.mem.eql(u8, args[1], "m1")) {
-        std.debug.print("usage: tf-muse m1 MODEL IN_DIR OUT_DIR   (knobs: MUSE_ROWS, MUSE_SLOTS, MUSE_LAYERS, MUSE_CONTEXT, MUSE_GREEDY, MUSE_CAPTURE, MUSE_TEACHER)\n", .{});
+        std.debug.print("usage: tf-muse m1 MODEL IN_DIR OUT_DIR   (knobs: MUSE_ROWS, MUSE_SLOTS, MUSE_LAYERS, MUSE_CONTEXT, MUSE_GREEDY, MUSE_CAPTURE, MUSE_TEACHER, MUSE_GRAPHS)\n" ++
+            "       tf-muse follow MODEL   (TP rank 1 behind tensorfold-native serve on rank 0; TF_TP_* as rank 0's)\n", .{});
         return 2;
     }
     const gpa = init.gpa;
@@ -229,5 +231,39 @@ pub fn main(init: std.process.Init) !u8 {
         t.greedy.deinit(gpa);
     }
     std.debug.print("DONE m1 rank {d}\n", .{rank});
+    return 0;
+}
+
+/// Rank 1 behind the native server: the model rank 0 announces (hello), then every step rank 0 sends, until it stops.
+fn follow(gpa: std.mem.Allocator, io: std.Io, model_dir: []const u8) !u8 {
+    const cfg = try tp.Config.fromEnv();
+    if (cfg.world < 2 or cfg.rank == 0) return error.FollowNeedsRankOne;
+    var driver = try cuda.Driver.open();
+    defer driver.close();
+    var ctx = try cuda.Context.init(&driver, @intCast(cfg.device));
+    defer ctx.deinit();
+    var session: tp.Session = undefined;
+    try session.open(&driver, cfg, @import("tp_kernel").mailbox);
+    defer {
+        session.announceStop();
+        session.close();
+    }
+    var buf: std.ArrayList(i64) = .empty;
+    defer buf.deinit(gpa);
+    const su = try muse.engine.setupOf(try session.plan.recvGrow(gpa, &buf));
+    std.debug.print("[follow] rank {d}: context {d}, {d} slots\n", .{ cfg.rank, su.context, su.slots });
+    const e = try muse.engine.Engine.init(gpa, io, &driver, model_dir, su, &session);
+    defer e.deinit();
+    std.debug.print("[follow] loaded; following\n", .{});
+    var steps: usize = 0;
+    while (true) {
+        const words = session.plan.recvGrow(gpa, &buf) catch |err| switch (err) {
+            error.PeerClosed => break,
+            else => return err,
+        };
+        if (!try e.follow(words)) break;
+        steps += 1;
+    }
+    std.debug.print("[follow] stopped after {d} steps\n", .{steps});
     return 0;
 }

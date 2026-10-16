@@ -14,6 +14,7 @@ pub const CK = 256; // keys an attention chunk
 pub const DECODE_ROWS = 128; // the EXL3 GEMV's row limit
 pub const NORM_THREADS = 1024;
 pub const BUCKET = 4096; // graphs: the smallest key bucket (full layers read bucket / CK chunks)
+pub const MAX_GRAPH_ROWS = 32; // wider windows (prompt chunks) run eagerly
 
 /// One decode row: a stream's cache slot, its position, its input token.
 pub const Row = struct { slot: u32, pos: u32, token: i64 };
@@ -268,6 +269,7 @@ pub const Model = struct {
     /// Graphed decode window: a graph per (rows, key bucket), captured after an eager warm-up of the same window;
     /// full layers read bucket / CK chunks (empty chunks merge to nothing, so replay bits equal eager bits).
     pub fn graphed(m: *Model, s: Stream, rows: []const Row, out: ?[]f32) !void {
+        if (rows.len > MAX_GRAPH_ROWS) return m.forward(s, rows, out, null); // prompt windows: eager, the same bits
         var end: usize = 0;
         for (rows) |r| end = @max(end, r.pos + 1);
         const full = (m.context + CK - 1) / CK * CK;

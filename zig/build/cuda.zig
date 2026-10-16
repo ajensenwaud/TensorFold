@@ -164,13 +164,14 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
 
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
 fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
+    const mimo = mimoModule(b, target, optimize, cuda, lanes, nemotron);
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
     const mod = b.createModule(.{
         .root_source_file = b.path("zig/src/native/cuda.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron", .module = nemotron }, .{ .name = "mimo_v2", .module = mimoModule(b, target, optimize, cuda, lanes, nemotron) } },
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron", .module = nemotron }, .{ .name = "mimo_v2", .module = mimo }, .{ .name = "muse_spark", .module = museModule(b, target, optimize, cuda, mimo) } },
     });
     return .{ .api = api, .engines = mod };
 }
@@ -192,7 +193,7 @@ fn museModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/muse_spark/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     m.addImport("cuda", cuda);
     m.addImport("core", mimo.import_table.get("core").?);
-    m.addImport("tp", mimo.import_table.get("tp").?);
+    for ([_][]const u8{ "tp", "tp_kernel", "lanes" }) |name| m.addImport(name, mimo.import_table.get(name).?);
     m.addImport("mimo_v2", mimo);
     return m;
 }

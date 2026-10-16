@@ -3,10 +3,14 @@
 pub const config = @import("config.zig");
 pub const load = @import("load.zig");
 pub const forward = @import("forward.zig");
+pub const engine = @import("engine.zig");
+pub const native = @import("native.zig");
 pub const Config = config.Config;
 
 test {
     _ = config;
     _ = load;
     _ = forward;
+    _ = engine;
+    _ = native;
 }
