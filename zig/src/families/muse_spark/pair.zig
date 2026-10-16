@@ -54,7 +54,7 @@ pub const Rank = struct {
         return 2;
     }
     /// recv[2 * count] <- both ranks' send[count]: each rank waits for its stream, publishes recv, copies its slice
-    /// into both ranks' recv, and waits for the other's copies.
+    /// into both ranks' recv on its stream, waits for the copies, then for the other rank's.
     fn allGather(ptr: *anyopaque, send: K.DevicePtr, recv: K.DevicePtr, count: usize, t: tp.DType, stream: K.Stream) K.Error!void {
         const r = of(ptr);
         const p = r.pair;
@@ -63,7 +63,9 @@ pub const Rank = struct {
         p.dst[r.rank] = recv;
         try p.barrier();
         const bytes = count * t.size();
-        for (p.dst) |dst| d.check(d.api.cuMemcpyDtoD_v2(dst + r.rank * bytes, send, bytes), "pair copy") catch return error.BackendFailed;
+        // on this rank's stream, finished before the barrier (a plain DtoD copy does not wait for completion)
+        for (p.dst) |dst| d.check(d.api.cuMemcpyDtoDAsync_v2(dst + r.rank * bytes, send, bytes, stream), "pair copy") catch return error.BackendFailed;
+        d.check(d.api.cuStreamSynchronize(stream), "pair sync") catch return error.BackendFailed;
         try p.barrier();
     }
     fn allReduce(_: *anyopaque, _: K.DevicePtr, _: K.DevicePtr, _: usize, _: tp.DType, _: tp.Op, _: K.Stream) K.Error!void {
