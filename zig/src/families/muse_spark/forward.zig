@@ -11,6 +11,7 @@ const Stream = cuda.Stream;
 pub const CK = 256; // keys an attention chunk
 pub const DECODE_ROWS = 128; // the EXL3 GEMV's row limit
 pub const NORM_THREADS = 1024;
+pub const BUCKET = 4096; // graphs: the smallest key bucket (full layers read bucket / CK chunks)
 
 /// One decode row: a stream's cache slot, its position, its input token.
 pub const Row = struct { slot: u32, pos: u32, token: i64 };
@@ -74,6 +75,9 @@ pub const Model = struct {
     f_rows: cuda.Function,
     f_merge: cuda.Function,
     context: usize,
+    graphs: std.AutoHashMapUnmanaged([2]u32, cuda.graph.Exec) = .empty,
+    replays: usize = 0,
+    captures: usize = 0,
     ring: usize,
     rows: usize,
     slots: usize,
@@ -96,6 +100,9 @@ pub const Model = struct {
         m.d = d;
         m.k3 = k3;
         m.context = context;
+        m.graphs = .empty;
+        m.replays = 0;
+        m.captures = 0;
         m.ring = ringSize(cfg.window, rows);
         m.rows = rows;
         m.slots = slots;
@@ -199,6 +206,9 @@ pub const Model = struct {
     }
 
     pub fn deinit(m: *Model) void {
+        var it = m.graphs.valueIterator();
+        while (it.next()) |e| e.deinit();
+        m.graphs.deinit(m.gpa);
         m.gpa.free(m.kc);
         m.gpa.free(m.vc);
         m.glue.unload();
@@ -244,6 +254,39 @@ pub const Model = struct {
         var end: usize = 0;
         for (rows) |r| end = @max(end, r.pos);
         try m.run(s, rows.len, end / CK + 1, cap);
+        if (out) |o| try m.logitsTo(s, rows.len, o) else try s.synchronize();
+    }
+
+    /// Graphed decode window: a graph per (rows, key bucket), captured after an eager warm-up of the same window;
+    /// full layers read bucket / CK chunks (empty chunks merge to nothing, so replay bits equal eager bits).
+    pub fn graphed(m: *Model, s: Stream, rows: []const Row, out: ?[]f32) !void {
+        var end: usize = 0;
+        for (rows) |r| end = @max(end, r.pos + 1);
+        const full = (m.context + CK - 1) / CK * CK;
+        const bucket = @min(full, @max(BUCKET, std.math.ceilPowerOfTwo(usize, end) catch unreachable));
+        const key: [2]u32 = .{ @intCast(rows.len), @intCast(bucket) };
+        try m.stage(rows);
+        if (m.graphs.get(key)) |exec| {
+            try exec.launchOn(s);
+            m.replays += 1;
+        } else {
+            try m.run(s, rows.len, bucket / CK, null); // warm-up: writes the same cache rows the replay will
+            try s.synchronize();
+            try cuda.graph.beginCapture(s, .thread_local);
+            m.run(s, rows.len, bucket / CK, null) catch |e| {
+                if (cuda.graph.endCapture(s)) |g| {
+                    var gg = g;
+                    gg.deinit();
+                } else |_| {}
+                return e;
+            };
+            var g = try cuda.graph.endCapture(s);
+            defer g.deinit();
+            const exec = try g.instantiate();
+            try m.graphs.put(m.gpa, key, exec);
+            try exec.launchOn(s);
+            m.captures += 1;
+        }
         if (out) |o| try m.logitsTo(s, rows.len, o) else try s.synchronize();
     }
 

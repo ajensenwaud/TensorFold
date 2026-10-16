@@ -5,7 +5,7 @@
 //! decode row (teacher-forced), then MUSE_GREEDY tokens greedily. OUT_DIR: <name>.logits.f32 [T, vocab],
 //! <name>.greedy.i32, and with MUSE_CAPTURE=1 <name>.res.f32 / <name>.attn.f32 (fp32 [layers, T, D]).
 //! Knobs: MUSE_ROWS (prompt rows a text a window, 1), MUSE_SLOTS (texts sharing a window, 1), MUSE_LAYERS (first
-//! layers only), MUSE_CONTEXT (4096), MUSE_GREEDY (32), MUSE_CAPTURE, MUSE_TEACHER.
+//! layers only), MUSE_CONTEXT (4096), MUSE_GREEDY (32), MUSE_CAPTURE, MUSE_TEACHER, MUSE_GRAPHS.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -105,6 +105,8 @@ pub fn main(init: std.process.Init) !u8 {
     const n_greedy = env("MUSE_GREEDY", 32);
     const capture = env("MUSE_CAPTURE", 0) != 0;
     const teacher = env("MUSE_TEACHER", 0) != 0;
+    const graphs = env("MUSE_GRAPHS", 0) != 0; // graphed windows (no captures): logits must equal the eager run's bits
+    if (graphs and (capture or teacher)) return error.GraphsTakeNoCaptures;
     const max_layers: ?usize = if (env("MUSE_LAYERS", 0) > 0) env("MUSE_LAYERS", 0) else null;
     if (rows_per * slots > muse.forward.DECODE_ROWS) return error.WindowTooWide;
 
@@ -189,7 +191,7 @@ pub fn main(init: std.process.Init) !u8 {
                 }
             }
             if (rows.items.len == 0) break;
-            try model.forward(s, rows.items, out[0 .. rows.items.len * V], cap);
+            if (graphs) try model.graphed(s, rows.items, out[0 .. rows.items.len * V]) else try model.forward(s, rows.items, out[0 .. rows.items.len * V], cap);
             windows += 1;
             total_rows += rows.items.len;
             for (rows.items, win[0..rows.items.len], 0..) |r, wv, i| {
@@ -199,7 +201,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
     const secs = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t1)) / 1e9;
-    std.debug.print("[m1] {d} windows, {d} rows in {d:.1}s (eager, with captures: not a speed number)\n", .{ windows, total_rows, secs });
+    std.debug.print("[m1] {d} windows, {d} rows in {d:.1}s ({s}; not a speed number); graphs captured {d}, replayed {d}\n", .{ windows, total_rows, secs, if (graphs) "graphed" else "eager", model.captures, model.replays });
     for (texts.items) |*t| {
         try writeAll(io, try std.fmt.allocPrint(ar, "{s}/{s}.logits.f32", .{ args[4], t.name }), std.mem.sliceAsBytes(t.logits));
         try writeAll(io, try std.fmt.allocPrint(ar, "{s}/{s}.greedy.i32", .{ args[4], t.name }), std.mem.sliceAsBytes(t.greedy.items));
