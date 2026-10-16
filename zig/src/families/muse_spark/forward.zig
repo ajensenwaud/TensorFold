@@ -15,6 +15,19 @@ pub const DECODE_ROWS = 128; // the EXL3 GEMV's row limit
 pub const NORM_THREADS = 1024;
 pub const BUCKET = 4096; // graphs: the smallest key bucket (full layers read bucket / CK chunks)
 pub const MAX_GRAPH_ROWS = 32; // wider windows (prompt chunks) run eagerly
+pub const MAX_CHUNKS = 64; // full layers' key chunks at most: chunks grow past CK keys with the context
+
+/// The key bucket of a window whose last row is at position end - 1: a power of two, at least BUCKET, at most the
+/// context (rounded up to CK). Graphs are keyed by it; eager windows take their chunk length from it too.
+pub fn bucketOf(context: usize, end: usize) usize {
+    const full = (context + CK - 1) / CK * CK;
+    return @min(full, @max(BUCKET, std.math.ceilPowerOfTwo(usize, end) catch unreachable));
+}
+
+/// Keys a full layer's chunk holds for a bucket: CK, or bucket / MAX_CHUNKS rounded up to CK past 16K keys.
+pub fn chunkKeys(bucket: usize) usize {
+    return @max(CK, std.mem.alignForward(usize, (bucket + MAX_CHUNKS - 1) / MAX_CHUNKS, CK));
+}
 
 /// One decode row: a stream's cache slot, its position, its input token.
 pub const Row = struct { slot: u32, pos: u32, token: i64 };
@@ -37,6 +50,7 @@ const Bufs = struct {
     slot: u64, // i32 [R]
     res: u64, // f32 [R, D]
     x: u64, // f16 [R, D]: the normed sublayer input
+    xf: u64, // f32 [R, D]: the normed MoE input unrounded (the router's)
     q: u64, // f16 [R, H * 64]
     k: u64, // f16 [R, HK * 64]
     v: u64,
@@ -113,7 +127,7 @@ pub const Model = struct {
         m.ring = ringSize(cfg.window, rows);
         m.rows = rows;
         m.slots = slots;
-        m.nch_max = @max((context + CK - 1) / CK, (cfg.window + 1 + CK - 1) / CK);
+        m.nch_max = @max(@min(MAX_CHUNKS, (context + CK - 1) / CK), (cfg.window + 1 + CK - 1) / CK);
         m.gpa = gpa;
         m.arena = .{ .d = d, .gpa = gpa };
         errdefer m.arena.deinit();
@@ -177,6 +191,7 @@ pub const Model = struct {
         b.slot = try ar.zeros(R * 4);
         b.res = try ar.zeros(R * D * 4);
         b.x = try ar.zeros(R * D * 2);
+        b.xf = try ar.zeros(R * D * 4);
         b.q = try ar.zeros(R * HQ * 2);
         b.k = try ar.zeros(R * HKD * 2);
         b.v = try ar.zeros(R * HKD * 2);
@@ -260,9 +275,9 @@ pub const Model = struct {
     /// Eager decode window: softcapped fp32 logits of every row into `out` [n, vocab] (or none).
     pub fn forward(m: *Model, s: Stream, rows: []const Row, out: ?[]f32, cap: ?Capture) !void {
         try m.stage(rows);
-        var end: usize = 0;
-        for (rows) |r| end = @max(end, r.pos);
-        try m.run(s, rows.len, end / CK + 1, cap);
+        var chunks: usize = 1; // the most any row's own chunking takes
+        for (rows) |r| chunks = @max(chunks, r.pos / chunkKeys(bucketOf(m.context, r.pos + 1)) + 1);
+        try m.run(s, rows.len, chunks, cap);
         if (out) |o| try m.logitsTo(s, rows.len, o) else try s.synchronize();
     }
 
@@ -272,18 +287,18 @@ pub const Model = struct {
         if (rows.len > MAX_GRAPH_ROWS) return m.forward(s, rows, out, null); // prompt windows: eager, the same bits
         var end: usize = 0;
         for (rows) |r| end = @max(end, r.pos + 1);
-        const full = (m.context + CK - 1) / CK * CK;
-        const bucket = @min(full, @max(BUCKET, std.math.ceilPowerOfTwo(usize, end) catch unreachable));
+        const bucket = bucketOf(m.context, end);
+        const chunks = (bucket + chunkKeys(bucket) - 1) / chunkKeys(bucket); // covers every row at or under bucket
         const key: [2]u32 = .{ @intCast(rows.len), @intCast(bucket) };
         try m.stage(rows);
         if (m.graphs.get(key)) |exec| {
             try exec.launchOn(s);
             m.replays += 1;
         } else {
-            try m.run(s, rows.len, bucket / CK, null); // warm-up: writes the same cache rows the replay will
+            try m.run(s, rows.len, chunks, null); // warm-up: writes the same cache rows the replay will
             try s.synchronize();
             try cuda.graph.beginCapture(s, .thread_local);
-            m.run(s, rows.len, bucket / CK, null) catch |e| {
+            m.run(s, rows.len, chunks, null) catch |e| {
                 if (cuda.graph.endCapture(s)) |g| {
                     var gg = g;
                     gg.deinit();
@@ -326,7 +341,7 @@ pub const Model = struct {
 
     /// res = res * alpha + rms(y') * beta with y = the ranks' partials summed in rank order, then x = half(rms(res) *
     /// w_next) (muse_gate_norm).
-    fn gateNorm(m: *Model, s: Stream, part: u64, scale: u64, ab: u64, w_next: u64, n: usize) !void {
+    fn gateNorm(m: *Model, s: Stream, part: u64, scale: u64, ab: u64, w_next: u64, xf: u64, n: usize) !void {
         const cfg = m.w.cfg;
         const y = try m.gather(s, part, n * cfg.hidden);
         var a: cuda.Args = .{};
@@ -340,6 +355,7 @@ pub const Model = struct {
         a.add(w_next);
         a.add(@as(f32, @floatCast(cfg.eps)));
         a.add(m.b.x);
+        a.add(xf);
         a.add(ci(cfg.hidden));
         try cuda.launch.launch(m.f_gate, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = NORM_THREADS, .y = 1, .z = 1 } }, s, &a);
     }
@@ -373,7 +389,7 @@ pub const Model = struct {
             inline for (.{ m.b.qo, m.kc[i], m.vc[i], m.b.pos, m.b.slot, m.b.po, m.b.pm, m.b.pl }) |p| a.add(p);
             a.add(ci(len));
             a.add(ci(nch));
-            a.add(ci(CK));
+            a.add(if (full) -ci((m.context + CK - 1) / CK * CK) else ci(CK)); // full: each row's own chunk width
             a.add(ci(win));
             a.add(ci(H));
             a.add(ci(HK));
@@ -393,7 +409,7 @@ pub const Model = struct {
         }
     }
 
-    /// MuseSparkMoE on the normed x: router (fp32), latent projection and norm, routed experts with the
+    /// MuseSparkMoE on the normed x: router (on xf, fp32), latent projection and norm, routed experts with the
     /// per-expert norm, back to the model width into part (fp32).
     fn moe(m: *Model, s: Stream, L: load_.Layer, n: usize) !void {
         const cfg = m.w.cfg;
@@ -401,7 +417,7 @@ pub const Model = struct {
         const K = cfg.top_k;
         {
             var a: cuda.Args = .{};
-            a.add(m.b.x);
+            a.add(m.b.xf);
             a.add(L.router);
             a.add(@as(c_int, @intFromBool(L.router_bf16)));
             a.add(m.b.logits);
@@ -460,7 +476,7 @@ pub const Model = struct {
         try m.proj(s, L.post, m.b.acc, m.b.part, true, n);
     }
 
-    /// The window's kernels on staged inputs, no host work; full layers read `chunks` key chunks of CK.
+    /// The window's kernels on staged inputs, no host work; full layers read `chunks` key chunks (each row's width).
     pub fn run(m: *Model, s: Stream, n: usize, chunks: usize, cap: ?Capture) !void {
         const cfg = m.w.cfg;
         const D = cfg.hidden;
@@ -486,11 +502,11 @@ pub const Model = struct {
             try m.proj(s, L.g, m.b.x, m.b.g, false, n);
             try m.attention(s, i, n, chunks);
             try m.proj(s, L.o, m.b.att, m.b.part, true, n);
-            try m.gateNorm(s, m.b.part, 0, L.attn_ab, L.ffn_norm, n);
+            try m.gateNorm(s, m.b.part, 0, L.attn_ab, L.ffn_norm, m.b.xf, n);
             if (cap) |c| try c.hook(c.ctx, .attn, i, m.b.res, n);
             try m.moe(s, L, n);
             const after = if (i + 1 < m.w.layers.len) m.w.layers[i + 1].in_norm else m.w.norm;
-            try m.gateNorm(s, m.b.part, L.post_ffn, L.mlp_ab, after, n);
+            try m.gateNorm(s, m.b.part, L.post_ffn, L.mlp_ab, after, 0, n);
             if (cap) |c| try c.hook(c.ctx, .mlp, i, m.b.res, n);
         }
         try m.proj(s, m.w.head, m.b.x, m.b.head, true, n);
@@ -542,6 +558,16 @@ pub const Model = struct {
 
 fn upload(d: *const cuda.Driver, at: u64, bytes: []const u8) !void {
     try d.check(d.api.cuMemcpyHtoD_v2(at, bytes.ptr, bytes.len), "upload");
+}
+
+test "chunks stay at 64 or fewer, and at CK keys up to 16K" {
+    try std.testing.expectEqual(@as(usize, 4096), bucketOf(4096, 2615));
+    try std.testing.expectEqual(@as(usize, 256), chunkKeys(4096));
+    try std.testing.expectEqual(@as(usize, 256), chunkKeys(16384));
+    try std.testing.expectEqual(@as(usize, 512), chunkKeys(32768));
+    try std.testing.expectEqual(@as(usize, 2048), chunkKeys(131072));
+    try std.testing.expectEqual(@as(usize, 40960), bucketOf(40960, 40000));
+    try std.testing.expect((40960 + chunkKeys(40960) - 1) / chunkKeys(40960) <= MAX_CHUNKS);
 }
 
 test "ring" {

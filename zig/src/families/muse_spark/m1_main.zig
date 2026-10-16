@@ -13,6 +13,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const tp = @import("tp");
 const muse = @import("muse_spark");
+const pair = @import("pair.zig");
 const Model = muse.forward.Model;
 
 fn env(name: [*:0]const u8, default: usize) usize {
@@ -115,32 +116,73 @@ pub fn main(init: std.process.Init) !u8 {
     const max_layers: ?usize = if (env("MUSE_LAYERS", 0) > 0) env("MUSE_LAYERS", 0) else null;
     if (rows_per * slots > muse.forward.DECODE_ROWS) return error.WindowTooWide;
 
-    const tpc: ?tp.Config = if (std.c.getenv("TF_TP_WORLD") != null) try tp.Config.fromEnv() else null;
-    const world: usize = if (tpc) |c| c.world else 1;
+    const kn: Knobs = .{ .rows_per = rows_per, .slots = slots, .context = context, .n_greedy = n_greedy, .capture = capture, .teacher = teacher, .graphs = graphs, .max_layers = max_layers };
+    const pair_mode = env("MUSE_PAIR", 0) != 0; // both ranks of TP=2 in this process on one GPU (an in-process gather)
+    const tpc: ?tp.Config = if (!pair_mode and std.c.getenv("TF_TP_WORLD") != null) try tp.Config.fromEnv() else null;
+    const world: usize = if (pair_mode) 2 else if (tpc) |c| c.world else 1;
     const rank: usize = if (tpc) |c| c.rank else 0;
     var driver = try cuda.Driver.open();
     defer driver.close();
     var ctx = try cuda.Context.init(&driver, if (tpc) |c| @intCast(c.device) else 0);
     defer ctx.deinit();
+    if (pair_mode) {
+        if (graphs) return error.PairIsEager; // the in-process gather syncs on the host
+        var pr: pair.Pair = .{ .d = &driver };
+        var r1: pair.Rank = .{ .pair = &pr, .rank = 1 };
+        var r0: pair.Rank = .{ .pair = &pr, .rank = 0 };
+        var err1: ?anyerror = null;
+        const th = try std.Thread.spawn(.{}, pairRank, .{ gpa, io, &driver, &ctx, args, kn, r1.collective(), &err1 });
+        runRank(gpa, ar, io, &driver, args, 0, 2, r0.collective(), kn) catch |e| {
+            pr.abort();
+            th.join();
+            return e;
+        };
+        th.join();
+        if (err1) |e| return e;
+        std.debug.print("DONE m1 pair\n", .{});
+        return 0;
+    }
     var session: tp.Session = undefined;
     if (world > 1) try session.open(&driver, tpc.?, @import("tp_kernel").mailbox);
     defer if (world > 1) {
         session.announceStop(); // a clean stop: the peer exits 0 instead of failing fast when this rank ends first
         session.close();
     };
-    var s = try cuda.Stream.init(&driver, false);
+    try runRank(gpa, ar, io, &driver, args, rank, world, if (world > 1) session.comm() else null, kn);
+    return 0;
+}
+
+const Knobs = struct { rows_per: usize, slots: usize, context: usize, n_greedy: usize, capture: bool, teacher: bool, graphs: bool, max_layers: ?usize };
+
+fn pairRank(gpa: std.mem.Allocator, io: std.Io, driver: *const cuda.Driver, ctx: *const cuda.Context, args: []const [:0]const u8, kn: Knobs, comm: tp.Collective, err: *?anyerror) void {
+    ctx.makeCurrent() catch |e| {
+        err.* = e;
+        return;
+    };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    runRank(gpa, arena.allocator(), io, driver, args, 1, 2, comm, kn) catch |e| {
+        std.debug.print("[m1] rank 1: {s}\n", .{@errorName(e)});
+        err.* = e;
+        comm.vtable.abort(comm.ptr); // rank 0 leaves its next gather instead of waiting forever
+    };
+}
+
+/// One rank's m1: load, every text's windows, rank 0 writes the dumps.
+fn runRank(gpa: std.mem.Allocator, ar: std.mem.Allocator, io: std.Io, driver: *const cuda.Driver, args: []const [:0]const u8, rank: usize, world: usize, comm: ?tp.Collective, kn: Knobs) !void {
+    var s = try cuda.Stream.init(driver, false);
     defer s.deinit();
     const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
-    var w = try muse.load.load(gpa, io, &driver, args[2], rank, world, .{ .max_layers = max_layers, .log = rank == 0 });
+    var w = try muse.load.load(gpa, io, driver, args[2], rank, world, .{ .max_layers = kn.max_layers, .log = rank == 0 });
     defer w.deinit();
-    var k3 = try cuda.exl3.Kernels.load(&driver);
+    var k3 = try cuda.exl3.Kernels.load(driver);
     defer k3.deinit();
-    var model = try Model.init(gpa, &driver, &w, &k3, if (world > 1) session.comm() else null, context, rows_per * slots, slots, s);
+    var model = try Model.init(gpa, driver, &w, &k3, comm, kn.context, kn.rows_per * kn.slots, kn.slots, s);
     defer model.deinit();
     const L = w.layers.len;
     const D = w.cfg.hidden;
     const V = w.full.vocab;
-    std.debug.print("[m1] rank {d}/{d}: loaded {d} layers in {d:.0}s ({d:.1} GiB weights, {d:.1} GiB model buffers); rows {d} x slots {d}, context {d}\n", .{ rank, world, L, @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e9, @as(f64, @floatFromInt(w.arena.total)) / (1 << 30), @as(f64, @floatFromInt(model.arena.total)) / (1 << 30), rows_per, slots, context });
+    std.debug.print("[m1] rank {d}/{d}: loaded {d} layers in {d:.0}s ({d:.1} GiB weights, {d:.1} GiB model buffers); rows {d} x slots {d}, context {d}\n", .{ rank, world, L, @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e9, @as(f64, @floatFromInt(w.arena.total)) / (1 << 30), @as(f64, @floatFromInt(model.arena.total)) / (1 << 30), kn.rows_per, kn.slots, kn.context });
 
     // texts
     const names_path = try std.fs.path.join(ar, &.{ args[3], "names.txt" });
@@ -151,51 +193,51 @@ pub fn main(init: std.process.Init) !u8 {
         const raw = try readAll(ar, io, try std.fmt.allocPrint(ar, "{s}/{s}.ids", .{ args[3], name }));
         const ids = try ar.alloc(i32, raw.len / 4);
         @memcpy(std.mem.sliceAsBytes(ids), raw[0 .. ids.len * 4]);
-        if (ids.len + n_greedy > context) return error.TextTooLong;
+        if (ids.len + kn.n_greedy > kn.context) return error.TextTooLong;
         var t: Text = .{ .name = name, .ids = ids, .logits = try gpa.alloc(f32, ids.len * V) };
-        if (teacher) {
+        if (kn.teacher) {
             const st = try readAll(gpa, io, try std.fmt.allocPrint(ar, "{s}/{s}.states.f32", .{ args[3], name }));
             if (st.len < L * ids.len * D * 4) return error.TeacherStatesShort;
             t.states = @alignCast(std.mem.bytesAsSlice(f32, st));
         }
-        if (capture) {
+        if (kn.capture) {
             t.res = try gpa.alloc(f32, L * ids.len * D);
             t.attn = try gpa.alloc(f32, L * ids.len * D);
         }
         try texts.append(ar, t);
     }
-    const R = rows_per * slots;
+    const R = kn.rows_per * kn.slots;
     const win = try ar.alloc(Win, R);
     const host = try ar.alloc(f32, R * D);
     const out = try gpa.alloc(f32, R * V);
     defer gpa.free(out);
-    var cc: Ctx = .{ .d = &driver, .s = s, .texts = texts.items, .win = win, .layers = L, .D = D, .host = host };
-    const cap: ?Model.Capture = if (capture or teacher) .{ .hook = &hook, .ctx = &cc, .teacher = teacher } else null;
+    var cc: Ctx = .{ .d = driver, .s = s, .texts = texts.items, .win = win, .layers = L, .D = D, .host = host };
+    const cap: ?Model.Capture = if (kn.capture or kn.teacher) .{ .hook = &hook, .ctx = &cc, .teacher = kn.teacher } else null;
 
     const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
     var windows: usize = 0;
     var total_rows: usize = 0;
     var b: usize = 0;
-    while (b < texts.items.len) : (b += slots) {
-        const batch = texts.items[b..@min(b + slots, texts.items.len)];
+    while (b < texts.items.len) : (b += kn.slots) {
+        const batch = texts.items[b..@min(b + kn.slots, texts.items.len)];
         while (true) {
             var rows: std.ArrayList(muse.forward.Row) = .empty;
             defer rows.deinit(gpa);
             for (batch, 0..) |*t, j| {
                 const T = t.ids.len;
                 if (t.fed < T) {
-                    const k = @min(rows_per, T - t.fed);
+                    const k = @min(kn.rows_per, T - t.fed);
                     for (0..k) |q| {
                         win[rows.items.len] = .{ .text = b + j, .pos = t.fed + q };
                         try rows.append(gpa, .{ .slot = @intCast(j), .pos = @intCast(t.fed + q), .token = t.ids[t.fed + q] });
                     }
                     t.fed += k;
                     t.last = rows.items.len - 1;
-                } else if (t.greedy.items.len < n_greedy) {
+                } else if (t.greedy.items.len < kn.n_greedy) {
                     const nxt = argmax(out[t.last * V ..][0..V]);
                     try t.greedy.append(gpa, nxt);
-                    if (t.greedy.items.len == n_greedy or w.full.isEos(@intCast(nxt))) {
-                        if (w.full.isEos(@intCast(nxt))) while (t.greedy.items.len < n_greedy) try t.greedy.append(gpa, -1);
+                    if (t.greedy.items.len == kn.n_greedy or w.full.isEos(@intCast(nxt))) {
+                        if (w.full.isEos(@intCast(nxt))) while (t.greedy.items.len < kn.n_greedy) try t.greedy.append(gpa, -1);
                         continue;
                     }
                     win[rows.items.len] = .{ .text = b + j, .pos = t.fed };
@@ -205,7 +247,7 @@ pub fn main(init: std.process.Init) !u8 {
                 }
             }
             if (rows.items.len == 0) break;
-            if (graphs) try model.graphed(s, rows.items, out[0 .. rows.items.len * V]) else try model.forward(s, rows.items, out[0 .. rows.items.len * V], cap);
+            if (kn.graphs) try model.graphed(s, rows.items, out[0 .. rows.items.len * V]) else try model.forward(s, rows.items, out[0 .. rows.items.len * V], cap);
             windows += 1;
             total_rows += rows.items.len;
             for (rows.items, win[0..rows.items.len], 0..) |r, wv, i| {
@@ -215,7 +257,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
     const secs = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t1)) / 1e9;
-    std.debug.print("[m1] {d} windows, {d} rows in {d:.1}s ({s}; not a speed number); graphs captured {d}, replayed {d}\n", .{ windows, total_rows, secs, if (graphs) "graphed" else "eager", model.captures, model.replays });
+    std.debug.print("[m1] {d} windows, {d} rows in {d:.1}s ({s}; not a speed number); graphs captured {d}, replayed {d}\n", .{ windows, total_rows, secs, if (kn.graphs) "graphed" else "eager", model.captures, model.replays });
     for (texts.items) |*t| if (rank == 0) {
         try writeAll(io, try std.fmt.allocPrint(ar, "{s}/{s}.logits.f32", .{ args[4], t.name }), std.mem.sliceAsBytes(t.logits));
         try writeAll(io, try std.fmt.allocPrint(ar, "{s}/{s}.greedy.i32", .{ args[4], t.name }), std.mem.sliceAsBytes(t.greedy.items));
@@ -231,7 +273,6 @@ pub fn main(init: std.process.Init) !u8 {
         t.greedy.deinit(gpa);
     }
     std.debug.print("DONE m1 rank {d}\n", .{rank});
-    return 0;
 }
 
 /// Rank 1 behind the native server: the model rank 0 announces (hello), then every step rank 0 sends, until it stops.

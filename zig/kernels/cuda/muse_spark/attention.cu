@@ -65,8 +65,18 @@ extern "C" __global__ void muse_qk_prep(const __half* __restrict__ q, const __ha
     vc[at + lane + 32] = vs[lane + 32];
 }
 
+// A full layer's chunk width for a row at position p (forward.zig chunkKeys(bucketOf(full, p + 1))): 256 keys up
+// to a 16K bucket, then bucket / 64 rounded up to 256, so a row's chunking depends on its own position only (the
+// same bits in any window) and no row needs more than 64 chunks.
+__device__ __forceinline__ int muse_chunk_keys(int p, int full) {
+    int b = 4096;
+    while (b < p + 1) b <<= 1;
+    b = min(full, b);
+    return max(256, ((b + 63) / 64 + 255) / 256 * 256);
+}
+
 // Grid (rows, HK, NCH), 256 threads. Keys of row r: [lo, pos] with lo = max(0, pos - win) (win 0: from key 0);
-// chunk c takes [lo + c * CK, lo + (c + 1) * CK). Partials: po [rows, H, NCH, 64], pm / pl [rows, H, NCH].
+// chunk c takes [lo + c * ck, lo + (c + 1) * ck), ck = CK > 0, or muse_chunk_keys(pos, -CK) for CK <= 0. Partials: po [rows, H, NCH, 64], pm / pl [rows, H, NCH].
 extern "C" __global__ void __launch_bounds__(256)
     muse_attn_rows(const __half* __restrict__ qo, const __half* __restrict__ kc, const __half* __restrict__ vc,
                    const int32_t* __restrict__ pos, const int32_t* __restrict__ slot, float* __restrict__ po,
@@ -80,8 +90,9 @@ extern "C" __global__ void __launch_bounds__(256)
     const int h = kvh * G + warp;
     const int p = pos[r];
     const int lo = win > 0 ? max(0, p - win) : 0;
-    const int start = lo + c * CK;
-    const int end = min(start + CK, p + 1);
+    const int ck = CK > 0 ? CK : muse_chunk_keys(p, -CK);
+    const int start = lo + c * ck;
+    const int end = min(start + ck, p + 1);
     const int64_t out = ((int64_t)r * H + h) * NCH + c;
     if (start >= end) {
         if (lane == 0) {

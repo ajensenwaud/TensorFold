@@ -80,13 +80,14 @@ extern "C" __global__ void muse_rms(const void* __restrict__ x, int x_half, cons
 }
 
 // A sublayer's end and the next norm (MuseSparkBlock): y' = y (+ y2) [* scale, rounded to bf16 when round_bf16];
-// yn = y' * rsqrt(mean(y'^2) + post_eps); res = res * alpha + yn * beta; x = half(rms(res) * w_next).
+// yn = y' * rsqrt(mean(y'^2) + post_eps); res = res * alpha + yn * beta; x = half(rms(res) * w_next), and xf = the
+// same unrounded (the router's fp32 input, exllamav3 patch 0004) unless null.
 // ab: fp32 [2, D] (alpha, beta). y2: the other rank's partial or null. A block a row.
 extern "C" __global__ void muse_gate_norm(float* __restrict__ res, const float* __restrict__ y,
                                           const float* __restrict__ y2, const float* __restrict__ scale,
                                           int round_bf16, float post_eps, const float* __restrict__ ab,
                                           const float* __restrict__ w_next, float next_eps, __half* __restrict__ x,
-                                          int D) {
+                                          float* __restrict__ xf, int D) {
     const int64_t r = blockIdx.x;
     float v[kMaxPer];
     float ss = 0.f;
@@ -113,24 +114,29 @@ extern "C" __global__ void muse_gate_norm(float* __restrict__ res, const float* 
     }
     const float rs2 = rsqrtf(block_sum(ss2) / (float)D + next_eps);
     n = 0;
-    for (int d = threadIdx.x; d < D; d += blockDim.x, ++n) x[r * D + d] = __float2half_rn(v[n] * rs2 * w_next[d]);
+    for (int d = threadIdx.x; d < D; d += blockDim.x, ++n) {
+        const float o = v[n] * rs2 * w_next[d];
+        x[r * D + d] = __float2half_rn(o);
+        if (xf) xf[r * D + d] = o;
+    }
 }
 
-// Router logits in fp32: out[r, e] = x[r].float() . W[e] (F.linear(x.float(), router_weight)); W bf16 or fp32.
+// Router logits in fp32: out[r, e] = x[r] . W[e] (F.linear(x.float(), router_weight)) on the fp32 normed input; W
+// bf16 or fp32.
 // Grid (E / 8, rows), 8 warps: a warp an expert.
-extern "C" __global__ void muse_router(const __half* __restrict__ x, const void* __restrict__ W, int w_bf16,
+extern "C" __global__ void muse_router(const float* __restrict__ x, const void* __restrict__ W, int w_bf16,
                                        float* __restrict__ out, int D, int E) {
     const int r = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int e = blockIdx.x * 8 + warp;
     if (e >= E) return;
-    const __half* xr = x + (int64_t)r * D;
+    const float* xr = x + (int64_t)r * D;
     float acc = 0.f;
     if (w_bf16) {
         const uint16_t* wr = (const uint16_t*)W + (int64_t)e * D;
-        for (int d = lane; d < D; d += 32) acc += __half2float(xr[d]) * __uint_as_float(((uint32_t)wr[d]) << 16);
+        for (int d = lane; d < D; d += 32) acc += xr[d] * __uint_as_float(((uint32_t)wr[d]) << 16);
     } else {
         const float* wr = (const float*)W + (int64_t)e * D;
-        for (int d = lane; d < D; d += 32) acc += __half2float(xr[d]) * wr[d];
+        for (int d = lane; d < D; d += 32) acc += xr[d] * wr[d];
     }
     acc = warp_sum(acc);
     if (lane == 0) out[(int64_t)r * E + e] = acc;
