@@ -6,6 +6,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const tp = @import("tp");
 const load_ = @import("load.zig");
+const dflash2 = @import("dflash2.zig");
 const exl3 = cuda.exl3;
 const Weights = load_.Weights;
 const Stream = cuda.Stream;
@@ -110,6 +111,7 @@ pub const Model = struct {
     b: Bufs,
     arena: load_.Arena,
     gpa: std.mem.Allocator,
+    dr: ?*dflash2.Drafter = null, // fed inside run: taps after its layers, the context update after the last layer
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const Weights, k3: *const exl3.Kernels, comm: ?tp.Collective, context: usize, rows: usize, slots: usize, s: Stream) !Model {
         const cfg = w.cfg;
@@ -129,6 +131,7 @@ pub const Model = struct {
         m.slots = slots;
         m.nch_max = @max(@min(MAX_CHUNKS, (context + CK - 1) / CK), (cfg.window + 1 + CK - 1) / CK);
         m.gpa = gpa;
+        m.dr = null;
         m.arena = .{ .d = d, .gpa = gpa };
         errdefer m.arena.deinit();
         m.glue = try cuda.Module.load(d, cuda.kernels.muse_glue);
@@ -508,7 +511,9 @@ pub const Model = struct {
             const after = if (i + 1 < m.w.layers.len) m.w.layers[i + 1].in_norm else m.w.norm;
             try m.gateNorm(s, m.b.part, L.post_ffn, L.mlp_ab, after, 0, n);
             if (cap) |c| try c.hook(c.ctx, .mlp, i, m.b.res, n);
+            if (m.dr) |dr| if (cap == null) try dr.tap(s, i, m.b.res, n);
         }
+        if (m.dr) |dr| if (cap == null) try dr.update(s, n);
         try m.proj(s, m.w.head, m.b.x, m.b.head, true, n);
         const cfgf = m.w.full;
         var a: cuda.Args = .{};

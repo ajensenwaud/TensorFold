@@ -5,6 +5,8 @@ pub const load = @import("load.zig");
 pub const forward = @import("forward.zig");
 pub const engine = @import("engine.zig");
 pub const native = @import("native.zig");
+pub const dflash2 = @import("dflash2.zig");
+pub const dflash2_config = @import("dflash2_config.zig");
 pub const Config = config.Config;
 
 test {
@@ -13,4 +15,6 @@ test {
     _ = forward;
     _ = engine;
     _ = native;
+    _ = dflash2;
+    _ = dflash2_config;
 }

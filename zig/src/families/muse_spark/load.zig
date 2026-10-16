@@ -147,7 +147,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, model_dir
 }
 
 /// The same cut in MiMo-V2's type (its `cut` does the trellis slicing).
-fn mc(c: config.Cut) mimo.config.Cut {
+pub fn mc(c: config.Cut) mimo.config.Cut {
     return .{ .prefix = c.prefix, .axis = switch (c.axis) {
         .whole => .whole,
         .n => .n,
