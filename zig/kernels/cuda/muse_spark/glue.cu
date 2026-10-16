@@ -57,15 +57,17 @@ extern "C" __global__ void muse_embed_norm(const uint16_t* __restrict__ table, c
 }
 
 // out = half(x * rsqrt(mean(x^2) + eps) * w) (RMSNorm: w = 1 + weight for the centred norms, weight, or none).
-// x fp32 (x_half 0) or fp16 (1). A block a row.
+// x fp32 (x_half 0) or fp16 (1); parts 0: x is [rows, D]; parts P: x is the ranks' gathered column slices
+// [D / P, rows, P] (rank-major all-gather of each rank's [rows, P]). A block a row.
 extern "C" __global__ void muse_rms(const void* __restrict__ x, int x_half, const float* __restrict__ w,
-                                    __half* __restrict__ out, int D, float eps) {
-    const int64_t r = blockIdx.x;
+                                    __half* __restrict__ out, int D, float eps, int parts) {
+    const int64_t r = blockIdx.x, rows = gridDim.x;
     float v[kMaxPer];
     float ss = 0.f;
     int n = 0;
     for (int d = threadIdx.x; d < D; d += blockDim.x, ++n) {
-        v[n] = x_half ? __half2float(((const __half*)x)[r * D + d]) : ((const float*)x)[r * D + d];
+        const int64_t at = parts ? ((int64_t)(d / parts) * rows + r) * parts + d % parts : r * D + d;
+        v[n] = x_half ? __half2float(((const __half*)x)[at]) : ((const float*)x)[at];
         ss += v[n] * v[n];
     }
     const float rs = rsqrtf(block_sum(ss) / (float)D + eps);
@@ -192,10 +194,11 @@ extern "C" __global__ void muse_topk(const float* __restrict__ logits, const flo
 }
 
 // The routed sum (MuseSparkMoE.forward): per slot, y (+ y2) [L] scaled by (1 + w) and rounded to bf16, normalised
-// (post_expert_norm, eps), times its routing weight, added in slot order to acc = 0; out = half(acc). A block a row.
+// (post_expert_norm, eps), times its routing weight, added in slot order to acc = 0; out = half(acc), only columns
+// [out_lo, out_lo + out_w) as out [rows, out_w] (a rank's post_expert_proj inputs under TP). A block a row.
 extern "C" __global__ void muse_expert_sum(const float* __restrict__ y, const float* __restrict__ y2,
                                            const float* __restrict__ wts, const float* __restrict__ scale, float eps,
-                                           __half* __restrict__ out, int L, int K) {
+                                           __half* __restrict__ out, int L, int K, int out_lo, int out_w) {
     const int64_t r = blockIdx.x;
     float acc[kMaxPer];
     float v[kMaxPer];
@@ -218,7 +221,8 @@ extern "C" __global__ void muse_expert_sum(const float* __restrict__ y, const fl
         for (int d = threadIdx.x; d < L; d += blockDim.x, ++n) acc[n] = acc[n] + (v[n] * rs) * wk;
     }
     n = 0;
-    for (int d = threadIdx.x; d < L; d += blockDim.x, ++n) out[r * L + d] = __float2half_rn(acc[n]);
+    for (int d = threadIdx.x; d < L; d += blockDim.x, ++n)
+        if (d >= out_lo && d < out_lo + out_w) out[r * out_w + d - out_lo] = __float2half_rn(acc[n]);
 }
 
 // The head: x = x * mult, then cap * tanh(x / cap) when cap > 0 (Linear pre_scale, ext.softcap), in place.
@@ -230,18 +234,18 @@ extern "C" __global__ void muse_softcap(float* __restrict__ x, int64_t n, float 
     }
 }
 
-// argmax over the first `vocab` columns of the gathered head (rank-major [world, n, stride]; rank k's columns are
-// vocabulary rows k * stride ..): the first index of the maximum; a NaN counts as the maximum. out int32 [n].
-extern "C" __global__ void muse_argmax(const float* __restrict__ recv, int32_t* __restrict__ out, int n, int stride,
-                                       int vocab) {
+// argmax over the first `vocab` columns of the head: rank 0's [n, w0] at recv, rank 1's [n, w1] at recv + part
+// (the gathered slices; part 0 and w0 = the head's rows on one GPU). The first index of the maximum; a NaN counts
+// as the maximum. out int32 [n].
+extern "C" __global__ void muse_argmax(const float* __restrict__ recv, int32_t* __restrict__ out, int w0, int w1,
+                                       int64_t part, int vocab) {
     __shared__ float bv[256];
     __shared__ int bi[256];
     const int r = blockIdx.x, tid = threadIdx.x;
     float best = -CUDART_INF_F;
     int idx = 0x7fffffff;
     for (int c = tid; c < vocab; c += 256) {
-        const int k = c / stride, j = c % stride;
-        const float v = recv[((int64_t)k * n + r) * stride + j];
+        const float v = c < w0 ? recv[(int64_t)r * w0 + c] : recv[part + (int64_t)r * w1 + (c - w0)];
         const bool nan_v = v != v, nan_b = best != best;
         if (idx == 0x7fffffff || (nan_v && !nan_b) || (!nan_b && v > best)) {
             best = v;

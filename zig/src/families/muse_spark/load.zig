@@ -45,6 +45,7 @@ pub const Weights = struct {
     head: exl3.Linear, // a rank's 128-row blocks of the padded head
     head_lo: usize, // its first vocabulary row
     head_stride: usize, // columns a rank's slice takes in a gather
+    head_rows: usize, // the padded head's rows, every rank's together (202112)
     arena: Arena,
     gpa: std.mem.Allocator,
 
@@ -71,7 +72,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, model_dir
     const view = try full.rankView(world);
     var ck = try core.Checkpoint.openModel(gpa, io, model_dir);
     defer ck.close();
-    var w: Weights = .{ .full = full, .cfg = view, .rank = rank, .world = world, .embed = 0, .layers = &.{}, .norm = 0, .head = undefined, .head_lo = 0, .head_stride = 0, .arena = .{ .d = d, .gpa = gpa }, .gpa = gpa };
+    var w: Weights = .{ .full = full, .cfg = view, .rank = rank, .world = world, .embed = 0, .layers = &.{}, .norm = 0, .head = undefined, .head_lo = 0, .head_stride = 0, .head_rows = 0, .arena = .{ .d = d, .gpa = gpa }, .gpa = gpa };
     errdefer w.deinit();
     const ar = &w.arena;
     const emb = try ck.get(P ++ "embed_tokens.weight");
@@ -140,6 +141,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, model_dir
     const hc = config.headCut(hm.n(), rank, world);
     w.head_lo = hc.lo;
     w.head_stride = config.headStride(hm.n(), world);
+    w.head_rows = hm.n();
     w.head = try ml.linear(gpa, ar, try ml.cut(gpa, hm, mc(hc)));
     return w;
 }

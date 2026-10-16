@@ -157,7 +157,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     // tf-muse: Muse Spark's decode forward against exllamav3's answer key
     const muse = museModule(b, target, optimize, cuda, mimo);
     const muse_exe = b.createModule(.{ .root_source_file = b.path("zig/src/families/muse_spark/m1_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
-    muse_exe.addImport("cuda", cuda);
+    for ([_][]const u8{ "cuda", "tp", "tp_kernel" }) |name| muse_exe.addImport(name, mimo.import_table.get(name).?);
     muse_exe.addImport("muse_spark", muse);
     b.installArtifact(b.addExecutable(.{ .name = "tf-muse", .root_module = muse_exe }));
 }
@@ -192,6 +192,7 @@ fn museModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/muse_spark/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     m.addImport("cuda", cuda);
     m.addImport("core", mimo.import_table.get("core").?);
+    m.addImport("tp", mimo.import_table.get("tp").?);
     m.addImport("mimo_v2", mimo);
     return m;
 }

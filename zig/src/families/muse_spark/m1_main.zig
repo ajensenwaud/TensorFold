@@ -6,9 +6,12 @@
 //! <name>.greedy.i32, and with MUSE_CAPTURE=1 <name>.res.f32 / <name>.attn.f32 (fp32 [layers, T, D]).
 //! Knobs: MUSE_ROWS (prompt rows a text a window, 1), MUSE_SLOTS (texts sharing a window, 1), MUSE_LAYERS (first
 //! layers only), MUSE_CONTEXT (4096), MUSE_GREEDY (32), MUSE_CAPTURE, MUSE_TEACHER, MUSE_GRAPHS.
+//! TP=2: TF_TP_WORLD=2 / TF_TP_RANK / TF_TP_MASTER / TF_TP_PORT on both nodes (same IN_DIR files on each); both
+//! ranks run the same windows, rank 0 writes OUT_DIR.
 
 const std = @import("std");
 const cuda = @import("cuda");
+const tp = @import("tp");
 const muse = @import("muse_spark");
 const Model = muse.forward.Model;
 
@@ -110,23 +113,32 @@ pub fn main(init: std.process.Init) !u8 {
     const max_layers: ?usize = if (env("MUSE_LAYERS", 0) > 0) env("MUSE_LAYERS", 0) else null;
     if (rows_per * slots > muse.forward.DECODE_ROWS) return error.WindowTooWide;
 
+    const tpc: ?tp.Config = if (std.c.getenv("TF_TP_WORLD") != null) try tp.Config.fromEnv() else null;
+    const world: usize = if (tpc) |c| c.world else 1;
+    const rank: usize = if (tpc) |c| c.rank else 0;
     var driver = try cuda.Driver.open();
     defer driver.close();
-    var ctx = try cuda.Context.init(&driver, 0);
+    var ctx = try cuda.Context.init(&driver, if (tpc) |c| @intCast(c.device) else 0);
     defer ctx.deinit();
+    var session: tp.Session = undefined;
+    if (world > 1) try session.open(&driver, tpc.?, @import("tp_kernel").mailbox);
+    defer if (world > 1) {
+        session.announceStop(); // a clean stop: the peer exits 0 instead of failing fast when this rank ends first
+        session.close();
+    };
     var s = try cuda.Stream.init(&driver, false);
     defer s.deinit();
     const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
-    var w = try muse.load.load(gpa, io, &driver, args[2], 0, 1, .{ .max_layers = max_layers, .log = true });
+    var w = try muse.load.load(gpa, io, &driver, args[2], rank, world, .{ .max_layers = max_layers, .log = rank == 0 });
     defer w.deinit();
     var k3 = try cuda.exl3.Kernels.load(&driver);
     defer k3.deinit();
-    var model = try Model.init(gpa, &driver, &w, &k3, context, rows_per * slots, slots, s);
+    var model = try Model.init(gpa, &driver, &w, &k3, if (world > 1) session.comm() else null, context, rows_per * slots, slots, s);
     defer model.deinit();
     const L = w.layers.len;
     const D = w.cfg.hidden;
     const V = w.full.vocab;
-    std.debug.print("[m1] loaded {d} layers in {d:.0}s ({d:.1} GiB weights, {d:.1} GiB model buffers); rows {d} x slots {d}, context {d}\n", .{ L, @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e9, @as(f64, @floatFromInt(w.arena.total)) / (1 << 30), @as(f64, @floatFromInt(model.arena.total)) / (1 << 30), rows_per, slots, context });
+    std.debug.print("[m1] rank {d}/{d}: loaded {d} layers in {d:.0}s ({d:.1} GiB weights, {d:.1} GiB model buffers); rows {d} x slots {d}, context {d}\n", .{ rank, world, L, @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e9, @as(f64, @floatFromInt(w.arena.total)) / (1 << 30), @as(f64, @floatFromInt(model.arena.total)) / (1 << 30), rows_per, slots, context });
 
     // texts
     const names_path = try std.fs.path.join(ar, &.{ args[3], "names.txt" });
@@ -202,18 +214,20 @@ pub fn main(init: std.process.Init) !u8 {
     }
     const secs = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t1)) / 1e9;
     std.debug.print("[m1] {d} windows, {d} rows in {d:.1}s ({s}; not a speed number); graphs captured {d}, replayed {d}\n", .{ windows, total_rows, secs, if (graphs) "graphed" else "eager", model.captures, model.replays });
-    for (texts.items) |*t| {
+    for (texts.items) |*t| if (rank == 0) {
         try writeAll(io, try std.fmt.allocPrint(ar, "{s}/{s}.logits.f32", .{ args[4], t.name }), std.mem.sliceAsBytes(t.logits));
         try writeAll(io, try std.fmt.allocPrint(ar, "{s}/{s}.greedy.i32", .{ args[4], t.name }), std.mem.sliceAsBytes(t.greedy.items));
         if (t.res) |x| try writeAll(io, try std.fmt.allocPrint(ar, "{s}/{s}.res.f32", .{ args[4], t.name }), std.mem.sliceAsBytes(x));
         if (t.attn) |x| try writeAll(io, try std.fmt.allocPrint(ar, "{s}/{s}.attn.f32", .{ args[4], t.name }), std.mem.sliceAsBytes(x));
         std.debug.print("[m1] {s}: {d} tokens, greedy {any}\n", .{ t.name, t.ids.len, t.greedy.items[0..@min(8, t.greedy.items.len)] });
+    };
+    for (texts.items) |*t| {
         gpa.free(t.logits);
         if (t.res) |x| gpa.free(x);
         if (t.attn) |x| gpa.free(x);
         if (t.states) |x| gpa.free(std.mem.sliceAsBytes(x));
         t.greedy.deinit(gpa);
     }
-    std.debug.print("DONE m1\n", .{});
+    std.debug.print("DONE m1 rank {d}\n", .{rank});
     return 0;
 }
