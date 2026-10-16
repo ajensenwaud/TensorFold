@@ -1,5 +1,6 @@
 //! Muse Spark behind the native server: the lane backend over engine.zig, on one GPU or two TP ranks (rank 1 runs
-//! `tf-muse follow`). After MiMo-V2's native.zig, without its drafter and prompt path: prompts run as decode windows.
+//! `tf-muse follow`). After MiMo-V2's native.zig, without its prompt path: prompts run as decode windows. The DFlash2
+//! drafter is opt-in: drafts on (the server's default) AND TF_MUSE_DRAFTER naming the drafter pack on every rank.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -7,6 +8,7 @@ const lanes = @import("lanes");
 const tp = @import("tp");
 const fwd = @import("forward.zig");
 const engine = @import("engine.zig");
+const dflash2 = @import("dflash2.zig");
 const be = lanes.backend;
 const Engine = engine.Engine;
 
@@ -36,7 +38,12 @@ pub const Loaded = struct {
     policy: []const u8 = "",
 };
 
-const Lane = struct { slot: u32 };
+/// DFlash2's acceptance at depth 1, 2, ... given the ones before, until a stream has its own: a prior from RadixArk's
+/// reported acceptance lengths (3.9-5.4 tokens a verify of 8 on GB300), to be replaced by measured ones.
+const draft_prior = [_]f64{ 0.80, 0.78, 0.78, 0.78, 0.78, 0.78, 0.78 };
+const first_copy_rows = 6; // a lone stream's first copy window (MiMo's measured best beside a drafter)
+
+const Lane = struct { slot: u32, held: [16]u32 = undefined, nheld: u32 = 0 };
 const ring = 1024;
 
 pub const Lanes = struct {
@@ -46,9 +53,10 @@ pub const Lanes = struct {
     free: u32, // slot bits
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
-    costs: [1]lanes.config.Cost = undefined,
+    costs: [16]lanes.config.Cost = undefined,
     shared: [32]lanes.config.Cost = undefined,
     nshared: usize = 0,
+    draft_ms: f64 = 0,
 
     fn of(p: *anyopaque) *Lanes {
         return @ptrCast(@alignCast(p));
@@ -58,30 +66,63 @@ pub const Lanes = struct {
         return .{ .ptr = l, .vtable = &.{ .prefill = prefillFn, .first = firstFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn } };
     }
 
+    fn block(l: *const Lanes) usize {
+        return if (l.e.dr) |dr| dr.block else 1;
+    }
+
     pub fn facts(l: *const Lanes) lanes.Model {
+        const drafting = l.e.dr != null;
+        const B: u32 = @intCast(l.block());
+        const geometric = if (std.c.getenv("TF_MUSE_DEPTH")) |v| std.mem.eql(u8, std.mem.span(v), "geometric") else false;
         return .{
             .exact_width = 8, // windows are row-invariant (tf-muse m1: 8 x 2 and 32 x 4 windows give one-row bits)
             .gpu_tokens = false,
-            .mtp = false,
-            .speculate = false,
+            .mtp = drafting,
+            .speculate = drafting,
             .speculate_early = false,
-            .drafts = 0,
-            .window_costs = l.costs[0..1],
+            .draft_prior = if (drafting) &draft_prior else &.{},
+            .drafts = B - 1,
+            .window_costs = l.costs[0..B],
+            .mtp_step_ms = l.draft_ms,
             .hidden_rows = true,
             .batch_rows = fwd.DECODE_ROWS,
             .max_streams = @intCast(l.e.model.slots),
             .shared_costs = l.shared[0..l.nshared],
+            .draft_streams = drafting,
+            .geometric_depth = drafting and geometric, // TF_MUSE_DEPTH=geometric: one acceptance a lone stream, measured costs
+            .first_copy_rows = if (drafting) envInt("TF_MUSE_COPY_ROWS", first_copy_rows) else 0,
         };
     }
 
-    /// Graphed forward costs at load on distinct tokens (one row; 2 .. 32 rows over the slots).
+    fn envInt(name: [*:0]const u8, default: u32) u32 {
+        const v = std.c.getenv(name) orelse return default;
+        return std.fmt.parseInt(u32, std.mem.span(v), 10) catch default;
+    }
+
+    /// Graphed forward costs at load on distinct tokens (1 .. block rows of one stream; 2 .. 32 rows over the slots),
+    /// and the draft pass (median of 16 after warm replays).
     pub fn measure(l: *Lanes, io: std.Io) !void {
         const e = l.e;
         var rows: [32]fwd.Row = undefined;
         var rng = std.Random.DefaultPrng.init(0x3A5E);
         const V = e.w.full.vocab;
-        rows[0] = .{ .slot = 0, .pos = 64, .token = 0 };
-        l.costs[0] = .{ .width = 1, .ms = try l.time(io, rows[0..1], 16, &rng, V) };
+        const B = l.block();
+        for (1..B + 1) |w| {
+            for (0..w) |j| rows[j] = .{ .slot = 0, .pos = @intCast(64 + j), .token = 0 };
+            l.costs[w - 1] = .{ .width = @intCast(w), .ms = try l.time(io, rows[0..w], 16, &rng, V) };
+        }
+        if (e.dr != null) {
+            var out: [16]i32 = undefined;
+            for (0..3) |_| try e.draft(&.{1000}, &.{64}, &.{0}, &out);
+            var dms: [16]f64 = undefined;
+            for (&dms, 0..) |*m, i| {
+                const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+                try e.draft(&.{@intCast(1000 + 7919 * i)}, &.{64}, &.{0}, &out);
+                m.* = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e6;
+            }
+            std.mem.sort(f64, &dms, {}, std.sort.asc(f64));
+            l.draft_ms = dms[8];
+        }
         l.nshared = 0;
         const S = e.model.slots;
         for (2..33) |n| {
@@ -89,7 +130,7 @@ pub const Lanes = struct {
             l.shared[l.nshared] = .{ .width = @intCast(n), .ms = try l.time(io, rows[0..n], 8, &rng, V) };
             l.nshared += 1;
         }
-        std.log.info("muse costs (distinct tokens): one row {d:.2} ms, shared 8 / 16 / 32 rows {d:.2} / {d:.2} / {d:.2} ms", .{ l.costs[0].ms, l.shared[6].ms, l.shared[14].ms, l.shared[l.nshared - 1].ms });
+        std.log.info("muse costs (distinct tokens): window {d:.2} .. {d:.2} ms (1 .. {d} rows), shared 8 / 16 / 32 rows {d:.2} / {d:.2} / {d:.2} ms, draft {d:.2} ms", .{ l.costs[0].ms, l.costs[B - 1].ms, B, l.shared[6].ms, l.shared[14].ms, l.shared[l.nshared - 1].ms, l.draft_ms });
     }
 
     /// Median ms of `reps` graphed forwards of `rows`, each on fresh pseudo-random tokens, after warm replays.
@@ -134,7 +175,7 @@ pub const Lanes = struct {
         const l = of(p);
         const e = l.e;
         const ids = s.prompt();
-        if (ids.len == 0 or ids.len + s.max_new + 1 > e.model.context) return error.PromptTooLong;
+        if (ids.len == 0 or ids.len + s.max_new + l.block() > e.model.context) return error.PromptTooLong;
         const gop = try l.lanes.getOrPut(l.gpa, s);
         if (!gop.found_existing) {
             if (l.free == 0) {
@@ -145,6 +186,7 @@ pub const Lanes = struct {
             l.free &= ~(@as(u32, 1) << @intCast(slot));
             gop.value_ptr.* = .{ .slot = slot };
         }
+        gop.value_ptr.nheld = 0;
         const slot = gop.value_ptr.slot;
         s.cached = 0;
         const greedy = s.sampling == null or s.sampling.?.temperature <= 0;
@@ -171,6 +213,13 @@ pub const Lanes = struct {
         return error.NotPipelined;
     }
 
+    fn value(l: *const Lanes, feed: be.Feed) u32 {
+        return switch (feed) {
+            .handle => |h| l.drawn[h % ring],
+            .value => |v| v,
+        };
+    }
+
     fn readFn(p: *anyopaque, handle: u64) anyerror!u32 {
         const l = of(p);
         if (handle >= l.next or l.next - handle > ring) return error.NoSuchToken;
@@ -186,8 +235,9 @@ pub const Lanes = struct {
             if (w.parents != null) return error.TreesNotBuilt;
             const lane = l.lanes.getPtr(w.stream) orelse return error.UnknownStream;
             if (n + w.rows() > rows.len) return error.WindowTooWide;
+            if (w.held > lane.nheld) return error.NoHeldDrafts;
             for (0..w.rows()) |r| {
-                const tok: u32 = if (r == 0) w.pending else w.tokens[r - 1];
+                const tok: u32 = if (r == 0) w.pending else if (w.held > 0) lane.held[r - 1] else w.tokens[r - 1];
                 rows[n] = .{ .slot = lane.slot, .pos = @intCast(w.positions[r] - 1), .token = tok };
                 n += 1;
             }
@@ -199,8 +249,9 @@ pub const Lanes = struct {
         try l.e.forward(rows[0..n], if (all_greedy) .ids else .logits);
         var r0: usize = 0;
         for (windows, out) |w, *o| {
+            const lane = l.lanes.getPtr(w.stream).?;
             for (0..w.rows()) |r| o.sampled[r] = if (all_greedy) @intCast(l.e.ids[r0 + r]) else try draw(l.gpa, l.rowOf(r0 + r), w.stream.sampling, w.positions[r]);
-            @memcpy(o.drafts, w.tokens);
+            if (w.held > 0) @memcpy(o.drafts, lane.held[0..w.held]) else @memcpy(o.drafts, w.tokens);
             r0 += w.rows();
         }
     }
@@ -212,8 +263,44 @@ pub const Lanes = struct {
         }
     }
 
-    fn draftFn(_: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
-        for (requests) |r| if (r.depth > 0) return error.NoDraftHead;
+    /// One draft pass (per 16 streams) for every request that asks for drafts; their contexts were fed by the
+    /// target's forwards (taps), so absorbing needs no work.
+    fn draftFn(p: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
+        const l = of(p);
+        const M = dflash2.MAX_STREAMS;
+        var toks: [M]i64 = undefined;
+        var pos0: [M]u32 = undefined;
+        var sl: [M]u32 = undefined;
+        var who: [M]*Lane = undefined;
+        var depth: [M]u32 = undefined;
+        var n: usize = 0;
+        for (requests) |r| {
+            const lane = l.lanes.getPtr(r.stream) orelse return error.UnknownStream;
+            lane.nheld = 0;
+            if (r.depth == 0) continue;
+            const dr = l.e.dr orelse return error.NoDraftHead;
+            toks[n] = if (r.follow.len > 0) r.follow[r.follow.len - 1] else l.value(r.first orelse return error.NoFirstToken);
+            pos0[n] = @intCast(r.position - 1);
+            sl[n] = lane.slot;
+            who[n] = lane;
+            depth[n] = @min(r.depth, @as(u32, @intCast(dr.block - 1)));
+            n += 1;
+            if (n == M) {
+                try l.draftBatch(toks[0..n], pos0[0..n], sl[0..n], who[0..n], depth[0..n]);
+                n = 0;
+            }
+        }
+        if (n > 0) try l.draftBatch(toks[0..n], pos0[0..n], sl[0..n], who[0..n], depth[0..n]);
+    }
+
+    fn draftBatch(l: *Lanes, toks: []const i64, pos0: []const u32, sl: []const u32, who: []const *Lane, depth: []const u32) !void {
+        const P = l.e.dr.?.block - 1;
+        var out: [dflash2.MAX_STREAMS * 16]i32 = undefined;
+        try l.e.draft(toks, pos0, sl, &out);
+        for (who, depth, 0..) |lane, dp, i| {
+            for (0..dp) |j| lane.held[j] = @intCast(out[i * P + j]);
+            lane.nheld = dp;
+        }
     }
 
     fn releaseFn(p: *anyopaque, s: *lanes.Stream) void {
@@ -264,9 +351,9 @@ const Owned = struct { gpa: std.mem.Allocator, e: *Engine, l: Lanes, session: ?*
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
     _ = kernels; // no captured Triton set: Muse runs its own CUDA kernels
     if (o.lanes == 0 or o.lanes > 32) return error.Slots;
-    if (o.drafts) return error.NoDrafter;
     if (o.policy.len > 0) return error.Policy;
-    const su: engine.Setup = .{ .context = o.context, .slots = o.lanes };
+    const drafting = o.drafts and std.c.getenv("TF_MUSE_DRAFTER") != null; // opt-in until the drafter's gates pass
+    const su: engine.Setup = .{ .context = o.context, .slots = o.lanes, .drafts = drafting };
     var session: ?*tp.Session = null;
     if (std.c.getenv("TF_TP_WORLD") != null) {
         const c = try tp.Config.fromEnv();
@@ -293,7 +380,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     return .{
         .backend = own.l.backend(),
         .facts = own.l.facts(),
-        .rows = 1,
+        .rows = @intCast(own.l.block()),
         .stream_bytes = 0,
         .free_streams = @intCast(su.slots),
         .ctx = own,
