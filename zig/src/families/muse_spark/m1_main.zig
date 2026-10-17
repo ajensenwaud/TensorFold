@@ -147,11 +147,14 @@ pub fn main(init: std.process.Init) !u8 {
     }
     var session: tp.Session = undefined;
     if (world > 1) try session.open(&driver, tpc.?, @import("tp_kernel").mailbox);
-    defer if (world > 1) {
-        session.announceStop(); // a clean stop: the peer exits 0 instead of failing fast when this rank ends first
-        session.close();
-    };
+    // a failed rank only closes: its hang-up fails the peer fast (exit 70) instead of leaving it in a collective
+    defer if (world > 1) session.close();
     try runRank(gpa, ar, io, &driver, args, rank, world, if (world > 1) session.comm() else null, kn);
+    if (world > 1) { // the stop: rank 0 (dumps written) announces it, then both meet, so neither close fails the other
+        if (rank == 0) session.announceStop();
+        try session.comm().barrier();
+        std.debug.print("STOPPED rank {d}: both ranks done\n", .{rank});
+    }
     return 0;
 }
 
