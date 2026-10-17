@@ -22,6 +22,7 @@ test {
     _ = @import("std_options.zig");
     _ = @import("fields.zig");
     _ = @import("reply_text.zig");
+    _ = @import("recipient_reply.zig");
     _ = @import("tool_parse.zig");
     _ = @import("tool_stream.zig");
     _ = @import("tool_params.zig");

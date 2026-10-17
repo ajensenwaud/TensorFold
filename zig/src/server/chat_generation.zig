@@ -3,6 +3,7 @@ const std = @import("std");
 const api = @import("engine_api");
 const json = @import("json.zig");
 const errors = @import("errors.zig");
+const recipient_reply = @import("recipient_reply.zig");
 const reply_text = @import("reply_text.zig");
 const tool_stream = @import("tool_stream.zig");
 const tool_parse = @import("tool_parse.zig");
@@ -139,8 +140,8 @@ pub const Generation = struct {
         const text = g.stops.visible(all, true);
         if (g.visible.pending()) return; // a character still split across tokens
         var answer = text;
-        if (g.thinking) {
-            const split = try reply_text.splitThinking(g.a, text, false, g.srv.markers);
+        if (g.thinking or g.srv.recipients) {
+            const split = if (g.srv.recipients) try recipient_reply.split(g.a, text, false) else try reply_text.splitThinking(g.a, text, false, g.srv.markers);
             const piece = g.streamed_reasoning.after(split.reasoning, true);
             if (piece.len > 0) {
                 try g.streamed_reasoning.set(g.a, split.reasoning, piece);
@@ -360,8 +361,8 @@ pub const Generation = struct {
             const close = try g.closeCall(visible);
             const text = if (close.len > 0) try std.mem.concat(a, u8, &.{ visible, close }) else visible;
             content = text;
-            if (g.thinking) {
-                const split = try reply_text.splitThinking(a, text, true, g.srv.markers);
+            if (g.thinking or g.srv.recipients) {
+                const split = if (g.srv.recipients) try recipient_reply.split(a, text, true) else try reply_text.splitThinking(a, text, true, g.srv.markers);
                 const r = reply_text.pyStrip(split.reasoning);
                 reasoning = if (r.len > 0) r else null;
                 content = split.answer;

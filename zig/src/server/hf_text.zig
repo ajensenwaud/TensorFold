@@ -36,6 +36,7 @@ pub const HfText = struct {
         t.tok.memo = try tokenizer.Memo.create(gpa, 64 << 20);
         const config = readJson(io, a, dir, "tokenizer_config.json");
         const model_config = readJson(io, a, dir, "config.json");
+        const gen_config = readJson(io, a, dir, "generation_config.json");
         if (template_override) |path| {
             t.source = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch |e| {
                 problem.* = try std.fmt.allocPrint(pa, "cannot read chat template override ({s})", .{@errorName(e)});
@@ -43,7 +44,7 @@ pub const HfText = struct {
             };
         } else try t.readTemplates(io, a, dir, config);
         t.specials = try specialsOf(a, config);
-        t.eos = try t.eosIds(a, model_config, config);
+        t.eos = try t.eosIds(a, model_config, config, gen_config);
         try t.readPostProcessor(io, a, dir);
         if (t.source.len > 0) {
             var diag: template.Diag = .{};
@@ -124,8 +125,8 @@ pub const HfText = struct {
         return .{ .object = out };
     }
 
-    /// Model end ids plus the tokenizer's chat end, when both are declared.
-    fn eosIds(t: *HfText, a: Allocator, model_config: std.json.Value, config: std.json.Value) ![]const u32 {
+    /// Model end ids plus generation_config.json's (as HF generate stops) and the tokenizer's chat end, when declared.
+    fn eosIds(t: *HfText, a: Allocator, model_config: std.json.Value, config: std.json.Value, gen_config: std.json.Value) ![]const u32 {
         var out: std.ArrayList(u32) = .empty;
         if (model_config == .object) {
             const holders = [_]?std.json.Value{ model_config.object.get("eos_token_id"), if (model_config.object.get("text_config")) |tc| (if (tc == .object) tc.object.get("eos_token_id") else null) else null };
@@ -139,6 +140,11 @@ pub const HfText = struct {
                 if (out.items.len > 0) break;
             }
         }
+        if (gen_config == .object) if (gen_config.object.get("eos_token_id")) |v| switch (v) {
+            .integer => |i| if (std.mem.indexOfScalar(u32, out.items, @intCast(i)) == null) try out.append(a, @intCast(i)),
+            .array => |list| for (list.items) |x| if (x == .integer and std.mem.indexOfScalar(u32, out.items, @intCast(x.integer)) == null) try out.append(a, @intCast(x.integer)),
+            else => {},
+        };
         if (config == .object) if (config.object.get("eos_token")) |e| {
             const piece = switch (e) {
                 .string => |s| s,
@@ -295,12 +301,14 @@ test "model EOS does not hide a different tokenizer chat end" {
     try t.tok.vocab.put("<|im_end|>", 248046);
     const model = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"text_config\":{\"eos_token_id\":248044}}", .{});
     const config = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"eos_token\":\"<|im_end|>\"}", .{});
-    try std.testing.expectEqualSlices(u32, &.{ 248044, 248046 }, try t.eosIds(a, model, config));
+    try std.testing.expectEqualSlices(u32, &.{ 248044, 248046 }, try t.eosIds(a, model, config, .null));
     const same = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"eos_token_id\":[248046]}", .{});
-    try std.testing.expectEqualSlices(u32, &.{248046}, try t.eosIds(a, same, config));
+    try std.testing.expectEqualSlices(u32, &.{248046}, try t.eosIds(a, same, config, .null));
     const added = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"eos_token\":{\"content\":\"<|im_end|>\"}}", .{});
-    try std.testing.expectEqualSlices(u32, &.{ 248044, 248046 }, try t.eosIds(a, model, added));
-    try std.testing.expectEqualSlices(u32, &.{248046}, try t.eosIds(a, .null, config));
+    try std.testing.expectEqualSlices(u32, &.{ 248044, 248046 }, try t.eosIds(a, model, added, .null));
+    try std.testing.expectEqualSlices(u32, &.{248046}, try t.eosIds(a, .null, config, .null));
+    const gen = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"eos_token_id\":[248044,200008]}", .{});
+    try std.testing.expectEqualSlices(u32, &.{ 248044, 200008, 248046 }, try t.eosIds(a, model, config, gen));
 }
 
 /// Our JSON value as std.json's, ints exact (past i64 as number strings) and keys in order.

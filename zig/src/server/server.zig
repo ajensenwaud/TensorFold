@@ -80,6 +80,8 @@ pub const Server = struct {
     late_system: []const u8 = "system",
     needs_user_after_tool: bool = false,
     markers: reply_text.Markers = reply_text.think_markers,
+    /// Replies are messages to recipients (Muse Spark's `to=self` / `to=user` / `to=<tool>`): recipient_reply.zig.
+    recipients: bool = false,
     chunks: chunk_plan.Plan = .{},
     effort_levels: []const []const u8 = &.{},
     eos: []const u32 = &.{},
@@ -124,6 +126,7 @@ pub const Server = struct {
         const a = srv.arena.allocator();
         srv.eos = try a.dupe(u32, text.eosIds());
         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
+        srv.recipients = @import("recipient_reply.zig").detect(text);
         srv.effort_levels = try fields.effortLevels(a, text.templateSource());
         srv.late_system = try lateSystem(a, text);
         srv.needs_user_after_tool = needsUserAfterTool(text.templateSource());
