@@ -380,7 +380,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     return .{
         .backend = own.l.backend(),
         .facts = own.l.facts(),
-        .rows = @intCast(own.l.block()),
+        // shared rounds need a family width >= 2 (lanes Config): 8 rows (exact_width) also without the drafter
+        .rows = @intCast(@max(own.l.block(), 8)),
         .stream_bytes = 0,
         .free_streams = @intCast(su.slots),
         .ctx = own,
