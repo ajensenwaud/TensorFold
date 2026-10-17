@@ -123,6 +123,7 @@ extern "C" __global__ void __launch_bounds__(256) dfl_topk(const float* __restri
     for (int c = t; c < valid; c += 256) {
         const float x = row[c];
         const int g = lo + c;
+        if (x != x) continue;  // a NaN logit is never a candidate
         if (!beats(x, g, v[TOPK - 1], id[TOPK - 1])) continue;
         int k = TOPK - 1;
         while (k > 0 && beats(x, g, v[k - 1], id[k - 1])) {
@@ -188,10 +189,11 @@ extern "C" __global__ void __launch_bounds__(512) dfl_walk(const float* __restri
             for (int k = 0; k < TOPK; ++k) {
                 int best = -1;
                 for (int j = 0; j < m; ++j)
-                    if (ai[j] != -1 && (best < 0 || beats(av[j], ai[j], av[best], ai[best]))) best = j;
-                cv[k] = av[best];
-                cid[k] = ai[best];
-                ai[best] = -1;
+                    if (ai[j] >= 0 && ai[j] != 0x7fffffff && (best < 0 || beats(av[j], ai[j], av[best], ai[best])))
+                        best = j;
+                cv[k] = best < 0 ? -CUDART_INF_F : av[best];  // no valid id left (non-finite rows): no candidate
+                cid[k] = best < 0 ? -1 : ai[best];
+                if (best >= 0) ai[best] = -1;
             }
         }
         __syncthreads();
@@ -199,17 +201,17 @@ extern "C" __global__ void __launch_bounds__(512) dfl_walk(const float* __restri
             const int c = cid[warp], a = pred;
             const __half* g = gate + (int64_t)row * R;
             float acc = 0.f;
-            for (int k = lane; k < R; k += 32)
+            for (int k = lane; c >= 0 && k < R; k += 32)
                 acc += (w16(pcb, (int64_t)a * R + k, cb_bf16) * __half2float(g[k])) * w16(scb, (int64_t)c * R + k, cb_bf16);
             acc = warp_sum(acc);
-            if (lane == 0) sc[warp] = cv[warp] + acc;
+            if (lane == 0) sc[warp] = c >= 0 ? cv[warp] + acc : -CUDART_INF_F;
         }
         __syncthreads();
         if (threadIdx.x == 0) {
             int best = 0;
             for (int k = 1; k < TOPK; ++k)
                 if (sc[k] > sc[best]) best = k;
-            pred = cid[best];
+            if (cid[best] >= 0) pred = cid[best];  // else the previous token again (the target rejects it)
             out[row] = pred;
         }
         __syncthreads();
