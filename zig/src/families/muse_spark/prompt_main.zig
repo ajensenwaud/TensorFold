@@ -42,7 +42,7 @@ pub fn run(gpa: std.mem.Allocator, ar: std.mem.Allocator, io: std.Io, driver: *c
     const context = env("MUSE_CONTEXT", 8192);
     const G = env("MUSE_GREEDY", 32);
     const max_layers: ?usize = if (env("MUSE_LAYERS", 0) > 0) env("MUSE_LAYERS", 0) else null;
-    var w = try muse.load.load(gpa, io, driver, args[2], rank, world, .{ .max_layers = max_layers, .log = rank == 0 });
+    var w = try muse.load.load(gpa, io, driver, args[2], rank, world, .{ .max_layers = max_layers, .log = rank == 0, .embed_host = muse.load.embedHostEnv() });
     defer w.deinit();
     var k3 = try cuda.exl3.Kernels.load(driver);
     defer k3.deinit();

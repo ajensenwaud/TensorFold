@@ -50,7 +50,7 @@ const Ctx = struct {
 pub fn run(mode: Mode, gpa: std.mem.Allocator, ar: std.mem.Allocator, io: std.Io, driver: *const cuda.Driver, args: []const [:0]const u8, rank: usize, world: usize, comm: ?tp.Collective, kn: Knobs) !void {
     var s = try cuda.Stream.init(driver, false);
     defer s.deinit();
-    var w = try muse.load.load(gpa, io, driver, args[2], rank, world, .{ .max_layers = kn.max_layers, .log = rank == 0 });
+    var w = try muse.load.load(gpa, io, driver, args[2], rank, world, .{ .max_layers = kn.max_layers, .log = rank == 0, .embed_host = muse.load.embedHostEnv() });
     defer w.deinit();
     var k3 = try cuda.exl3.Kernels.load(driver);
     defer k3.deinit();
