@@ -33,10 +33,20 @@ pub fn chunkKeys(bucket: usize) usize {
 /// linear_multi.cu's instantiations (EXL3 bits a weight; mul1 codebook, 4 warps).
 pub const multi_k2s = [_]u32{ 2, 3, 4, 5, 6, 8 };
 
-/// TF_MUSE_FAST (default on; 0 = the original launches): q / k / v / gate in one launch, the router on 2-warp blocks.
-pub fn fastEnv() bool {
-    const v = std.c.getenv("TF_MUSE_FAST") orelse return true;
-    return !std.mem.eql(u8, std.mem.span(v), "0");
+/// TF_MUSE_FAST lever bits (all byte-identical to the original launches): 1 q / k / v / gate in one launch (<= 16
+/// rows), 2 the router on 2-warp blocks, 4 cluster gate norm and expert sum, 8 32-row passes (17-128 rows), 16
+/// 32-member expert tiles (prompt path). Unset = FAST_DEFAULT; 0 = the original launches; 1 = every lever.
+pub const FAST_QKVG: u32 = 1;
+pub const FAST_ROUTER: u32 = 2;
+pub const FAST_CLUSTER: u32 = 4;
+pub const FAST_LIN32: u32 = 8;
+pub const FAST_X32: u32 = 16;
+pub const FAST_ALL: u32 = 31;
+pub const FAST_DEFAULT: u32 = FAST_ALL;
+pub fn fastEnv() u32 {
+    const v = std.c.getenv("TF_MUSE_FAST") orelse return FAST_DEFAULT;
+    const x = std.fmt.parseInt(u32, std.mem.span(v), 0) catch return FAST_DEFAULT;
+    return if (x == 1) FAST_ALL else x;
 }
 
 /// TF_MUSE_OVERLAP=1: the router and top-k on a side stream, overlapping the latent projection and its gather.
@@ -112,7 +122,7 @@ pub const Model = struct {
     f_multi: [multi_k2s.len]cuda.Function,
     f_rotm: cuda.Function,
     f_lin2: [multi_k2s.len][2]cuda.Function, // linear_body2 (32-row passes, the same bits) at 4 and 8 warps
-    fast: bool,
+    fast: u32, // TF_MUSE_FAST bits (FAST_*), each lever byte-identical to the original launches
     f_embed: cuda.Function,
     f_rms: cuda.Function,
     f_gate: cuda.Function,
@@ -139,6 +149,7 @@ pub const Model = struct {
     ks: []u64, // kv8: fp32 [slots, context, HK] key scales of a full layer (0: fp16 cache)
     vs: []u64,
     kv8: bool = false,
+    kv8_mode: c_int = 1, // 1 int8 (TF_MUSE_KV8=1), 2 e4m3 (TF_MUSE_KV8=2)
     cos: u64, // fp32 [context, 32] (one theta: every RoPE layer's)
     sin: u64,
     theta: f64,
@@ -220,6 +231,7 @@ pub const Model = struct {
         const HK = cfg.kv_heads;
         const hd = cfg.head_dim;
         m.kv8 = kv8;
+        m.kv8_mode = if (std.c.getenv("TF_MUSE_KV8")) |v| (if (std.mem.eql(u8, std.mem.span(v), "2")) 2 else 1) else 1;
         m.kc = try gpa.alloc(u64, L);
         m.vc = try gpa.alloc(u64, L);
         m.ks = try gpa.alloc(u64, L);
@@ -484,7 +496,7 @@ pub const Model = struct {
     pub fn qkvg(m: *Model, s: Stream, L: load_.Layer, x: u64, q: u64, k: u64, v: u64, g: u64, n: usize) !void {
         const ls = [4]exl3.Linear{ L.q, L.k, L.v, L.g };
         const outs = [4]u64{ q, k, v, g };
-        var ok = m.fast and n <= 16; // wider windows: proj's 32-row passes
+        var ok = m.fast & FAST_QKVG != 0 and n <= 16; // wider windows: proj's 32-row passes
         const fi = std.mem.indexOfScalar(u32, &multi_k2s, L.q.k2);
         if (fi == null) ok = false;
         for (ls) |l| if (l.k2 != L.q.k2 or l.split[1] != 4 or l.k != L.q.k or l.bias != 0) {
@@ -533,7 +545,7 @@ pub const Model = struct {
 
     /// A block-a-row glue kernel (1024 threads) or, with TF_MUSE_FAST, its cluster twin (8 x 128 threads a row).
     pub fn rowLaunch(m: *const Model, f: cuda.Function, fc: cuda.Function, width: usize, n: usize, s: Stream, a: *cuda.Args) !void {
-        if (m.fast and width <= 16 * NORM_THREADS) {
+        if (m.fast & FAST_CLUSTER != 0 and width <= 16 * NORM_THREADS) {
             try cuda.launch.launch(fc, .{ .grid = .{ .x = u(n * 8), .y = 1, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, a);
         } else try cuda.launch.launch(f, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = NORM_THREADS, .y = 1, .z = 1 } }, s, a);
     }
@@ -543,7 +555,7 @@ pub const Model = struct {
         const z = if (l.split[0] > 1) m.b.z else 0;
         const ki = std.mem.indexOfScalar(u32, &multi_k2s, l.k2);
         const wi: ?usize = if (l.split[1] == 4) 0 else if (l.split[1] == 8) 1 else null;
-        if (!m.fast or n <= 16 or ki == null or wi == null or n > 128) {
+        if (m.fast & FAST_LIN32 == 0 or n <= 16 or ki == null or wi == null or n > 128) {
             return m.k3.linear(s, l, x, .f16, m.b.xh, out, if (out_f32) .f32 else .f16, z, n);
         }
         // linear_kernel's launch on linear_body2 (32-row passes): exl3.zig linearRows' arguments and grid
@@ -595,6 +607,7 @@ pub const Model = struct {
             a.add(@as(f32, @floatCast(cfg.eps)));
             a.add(m.ks[i]);
             a.add(m.vs[i]);
+            a.add(@as(c_int, m.kv8_mode));
             try cuda.launch.launch(m.f_prep, .{ .grid = .{ .x = u(n), .y = u(H + HK), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &a);
         }
         const win: usize = if (full) 0 else cfg.window;
@@ -611,6 +624,7 @@ pub const Model = struct {
             a.add(@as(f32, @floatCast(cfg.smScale())));
             a.add(m.ks[i]);
             a.add(m.vs[i]);
+            a.add(@as(c_int, m.kv8_mode));
             try cuda.launch.launch(m.f_rows, .{ .grid = .{ .x = u(n), .y = u(HK), .z = u(nch) }, .block = .{ .x = 256, .y = 1, .z = 1 } }, s, &a);
         }
         {
@@ -645,7 +659,7 @@ pub const Model = struct {
             a.add(m.b.logits);
             a.add(ci(cfg.hidden));
             a.add(ci(E));
-            const rw: usize = if (m.fast) 2 else 8; // 2 warps a block spread one row's 256 experts over every SM
+            const rw: usize = if (m.fast & FAST_ROUTER != 0) 2 else 8; // 2 warps a block spread one row's 256 experts over every SM
             try cuda.launch.launch(m.f_router, .{ .grid = .{ .x = u((E + rw - 1) / rw), .y = u(n), .z = 1 }, .block = .{ .x = u(32 * rw), .y = 1, .z = 1 } }, rs, &a);
         }
         {

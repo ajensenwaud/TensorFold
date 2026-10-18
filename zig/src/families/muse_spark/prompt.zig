@@ -63,6 +63,8 @@ pub const Prompt = struct {
     h_ids: []i64,
     h_pos: []i32,
     h_slot: []i32,
+    prof: ?*[9]f64 = null, // TF_MUSE_PROMPT_PROFILE: ms per phase (synchronised; not a speed number)
+    io: ?std.Io = null,
 
     pub fn init(m: *Model, gpa: std.mem.Allocator, cap: usize, ewin_: usize, exact: bool, s: Stream) !*Prompt {
         const w = m.w;
@@ -73,6 +75,8 @@ pub const Prompt = struct {
         const pr = try gpa.create(Prompt);
         errdefer gpa.destroy(pr);
         pr.* = undefined;
+        pr.prof = null;
+        pr.io = null;
         pr.m = m;
         pr.gpa = gpa;
         pr.cap = cap;
@@ -147,7 +151,7 @@ pub const Prompt = struct {
 
     /// k3.grouped's launch, or with TF_MUSE_FAST its 32-member-tile twin (experts2.cu, the same bits).
     fn grouped(pr: *Prompt, s: Stream, g: exl3.Kernels.GroupedArgs) !void {
-        if (!pr.m.fast) return pr.m.k3.grouped(s, g);
+        if (pr.m.fast & fwd.FAST_X32 == 0) return pr.m.k3.grouped(s, g);
         if (g.k % (16 * g.sk * g.warps) != 0 or g.n % (16 * g.nt) != 0) return error.UnevenSplit;
         var ci_: ?usize = null;
         for (exl3.grouped_cfgs, 0..) |c, i| if (c[0] == g.nt and c[1] == g.warps and c[2] == g.pf) {
@@ -159,6 +163,17 @@ pub const Prompt = struct {
         inline for (.{ g.x0, g.x1, g.tp0, g.tp1, g.k2_0, g.k2_1, g.uids, g.ucount, g.members, g.z }) |p| a.add(p);
         inline for (.{ g.k, g.n, g.p, g.sk, g.maxm, g.slots }) |v| a.add(ci(v));
         try cuda.launch.launch(f, .{ .grid = .{ .x = u(g.nexp_max), .y = u(g.n / (16 * g.nt)), .z = u(g.mats * g.sk * mt) }, .block = .{ .x = g.warps * 32, .y = 1, .z = 1 } }, s, &a);
+    }
+
+    pub const phases = [_][]const u8{ "attention", "o gather+norm", "router+latent", "experts", "expert gather", "expert sum", "post proj", "post gather+norm", "drafter" };
+
+    /// Profiling: synchronise and add the time since the last mark to phase `ph`.
+    fn mark(pr: *Prompt, s: Stream, ph: usize, t: *i96) !void {
+        const p = pr.prof orelse return;
+        try s.synchronize();
+        const now = std.Io.Clock.awake.now(pr.io.?).toNanoseconds();
+        p[ph] += @as(f64, @floatFromInt(now - t.*)) / 1e6;
+        t.* = now;
     }
 
     /// The ranks' fp32 partials [count] gathered into big (rank-major); (rank 0's, rank 1's or 0).
@@ -196,7 +211,7 @@ pub const Prompt = struct {
 
     /// MuseSparkMoE over the chunk: router and latent for every row, routed experts in windows of ewin rows (per-slot
     /// outputs gathered, normed and summed per window), post_expert_proj into part.
-    fn moe(pr: *Prompt, s: Stream, L: load_.Layer, n: usize) !void {
+    fn moe(pr: *Prompt, s: Stream, L: load_.Layer, n: usize, t: *i96) !void {
         const m = pr.m;
         const cfg = m.w.cfg;
         const E = cfg.experts;
@@ -209,7 +224,7 @@ pub const Prompt = struct {
             a.add(pr.logits);
             a.add(ci(cfg.hidden));
             a.add(ci(E));
-            const rw: usize = if (m.fast) 2 else 8;
+            const rw: usize = if (m.fast & fwd.FAST_ROUTER != 0) 2 else 8;
             try cuda.launch.launch(m.f_router, .{ .grid = .{ .x = u((E + rw - 1) / rw), .y = u(n), .z = 1 }, .block = .{ .x = u(32 * rw), .y = 1, .z = 1 } }, s, &a);
         }
         {
@@ -222,8 +237,8 @@ pub const Prompt = struct {
             a.add(@as(f32, @floatCast(cfg.route_scale)));
             a.add(pr.pick);
             a.add(pr.wts);
-            const t = std.math.ceilPowerOfTwo(usize, @max(E, 32)) catch unreachable;
-            try cuda.launch.launch(m.f_topk, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = u(t), .y = 1, .z = 1 } }, s, &a);
+            const tn = std.math.ceilPowerOfTwo(usize, @max(E, 32)) catch unreachable;
+            try cuda.launch.launch(m.f_topk, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = u(tn), .y = 1, .z = 1 } }, s, &a);
         }
         try pr.proj(s, L.pre, pr.x, pr.lat, false, n);
         if (m.comm) |c| {
@@ -231,6 +246,7 @@ pub const Prompt = struct {
             try c.allGather(pr.lat, pr.latg, n * half, .f16, s.handle);
             try m.normParts(s, pr.latg, true, L.pre_norm, pr.latn, n, cfg.latent, cfg.eps, half);
         } else try m.norm(s, pr.lat, true, L.pre_norm, pr.latn, n, cfg.latent, cfg.eps);
+        try pr.mark(s, 2, t);
         const k3 = m.k3;
         const e = L.experts;
         const sc = pr.sc;
@@ -248,7 +264,9 @@ pub const Prompt = struct {
             try k3.gateupEpilogue(s, sc.z, pick, e.svh_g, e.svh_u, e.suh_d, sc.xd, r, p, e.width, gu[2], K, E, std.math.inf(f32), 1);
             try pr.grouped(s, .{ .x0 = sc.xd, .x1 = sc.xd, .tp0 = e.down_ptr, .tp1 = e.down_ptr, .k2_0 = e.down_k2, .k2_1 = e.down_k2, .uids = sc.ids, .ucount = sc.count, .members = sc.members, .z = sc.z, .mats = 1, .k = e.width, .n = e.dims, .p = p, .sk = dn[2], .slots = K, .maxm = r, .nexp_max = nexp, .nt = dn[0], .warps = dn[1], .pf = dn[3], .lo = e.k2_d[0], .hi = e.k2_d[1] });
             try k3.downEpilogue(s, sc.z, pick, e.svh_d, sc.y, r, p, e.dims, dn[2], K, E); // y over xg / xu / xd (dead now)
+            try pr.mark(s, 3, t);
             const y = try pr.gather(s, sc.y, p * e.dims); // z is dead too: the landing reuses it
+            try pr.mark(s, 4, t);
             var a: cuda.Args = .{};
             a.add(y[0]);
             a.add(y[1]);
@@ -261,8 +279,10 @@ pub const Prompt = struct {
             a.add(ci(m.w.rank * L.post.k));
             a.add(ci(L.post.k));
             try m.rowLaunch(m.f_esum, m.f_esum_c, cfg.latent, r, s, &a);
+            try pr.mark(s, 5, t);
         }
         try pr.proj(s, L.post, pr.acc, pr.part, true, n);
+        try pr.mark(s, 6, t);
     }
 
     /// One prompt chunk at [p0, p0 + n) of `slot`: every layer's caches written (and the drafter's context), the last
@@ -296,12 +316,17 @@ pub const Prompt = struct {
             try cuda.launch.launch(m.f_embed, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = fwd.NORM_THREADS, .y = 1, .z = 1 } }, s, &a);
         }
         try m.norm(s, pr.res, false, m.w.layers[0].in_norm, pr.x, n, D, cfg.eps);
+        var t: i96 = if (pr.prof != null) std.Io.Clock.awake.now(pr.io.?).toNanoseconds() else 0;
+        try pr.mark(s, 8, &t);
         for (m.w.layers, 0..) |L, i| {
             try pr.attention(s, L, i, p0, n);
+            try pr.mark(s, 0, &t);
             try m.gateNormAt(s, pr.res, try pr.gather(s, pr.part, n * D), 0, L.attn_ab, L.ffn_norm, pr.x, pr.xf, n);
-            try pr.moe(s, L, n);
+            try pr.mark(s, 1, &t);
+            try pr.moe(s, L, n, &t);
             const after = if (i + 1 < m.w.layers.len) m.w.layers[i + 1].in_norm else m.w.norm;
             try m.gateNormAt(s, pr.res, try pr.gather(s, pr.part, n * D), L.post_ffn, L.mlp_ab, after, pr.x, 0, n);
+            try pr.mark(s, 7, &t);
             if (m.dr) |dr| try dr.tapInto(s, i, pr.res, n, pr.taps);
         }
         if (m.dr) |dr| {
