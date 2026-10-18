@@ -57,6 +57,8 @@ const kernels = [_]Kernel{
     .{ .name = "muse_glue", .src = "muse_spark/glue", .flags = glue }, // Muse Spark: norms, gates, router, expert sums, head
     .{ .name = "muse_attention", .src = "muse_spark/attention", .flags = &.{"-O3"} }, // Muse Spark: head_dim 64 decode attention
     .{ .name = "muse_dflash2", .src = "muse_spark/dflash2", .flags = glue }, // Muse Spark: DFlash2 drafter convs, top-k, selector walk
+    .{ .name = "muse_experts2", .src = "muse_spark/experts2", .flags = &.{ "-O3", "-lineinfo" } }, // Muse Spark: 32-member expert tiles
+    .{ .name = "muse_linear", .src = "muse_spark/linear_multi", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // Muse Spark: q/k/v/gate in one launch
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.

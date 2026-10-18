@@ -2,6 +2,7 @@
 // Each op follows exllamav3's muse_spark modules (the parity oracle) in its roundings; fp32 inside.
 // Built with the glue flags (no contraction, IEEE division and square root): zig/build/cuda.zig.
 
+#include <cooperative_groups.h>
 #include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -35,6 +36,20 @@ __device__ float block_sum(float v) {
     }
     __syncthreads();
     return total;
+}
+
+// block_sum of a 1024-thread block spread over a cluster of 8 blocks of 128 (thread t of the row = rank * 128 +
+// threadIdx.x): the same warp sums, the 32 warp partials read back in warp order by every warp, the same final
+// warp_sum, so the total has block_sum's bits. `part`: 4 floats of shared memory not reused before the last sync.
+__device__ __forceinline__ float cluster_sum(float v, float* part) {
+    namespace cg = cooperative_groups;
+    cg::cluster_group cl = cg::this_cluster();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    v = warp_sum(v);
+    if (lane == 0) part[warp] = v;
+    cl.sync();
+    const float* rp = cl.map_shared_rank(part, lane >> 2);
+    return warp_sum(rp[lane & 3]);
 }
 
 }  // namespace
@@ -121,19 +136,75 @@ extern "C" __global__ void muse_gate_norm(float* __restrict__ res, const float* 
     }
 }
 
+// muse_gate_norm on a cluster of 8 blocks of 128 threads a row (grid rows * 8): thread t's columns, sums and
+// arithmetic as muse_gate_norm's thread t, so the outputs have its bits; the row's loads spread over 8 SMs.
+extern "C" __global__ void __cluster_dims__(8, 1, 1) __launch_bounds__(128)
+    muse_gate_norm_c(float* __restrict__ res, const float* __restrict__ y, const float* __restrict__ y2,
+                     const float* __restrict__ scale, int round_bf16, float post_eps, const float* __restrict__ ab,
+                     const float* __restrict__ w_next, float next_eps, __half* __restrict__ x,
+                     float* __restrict__ xf, int D) {
+    __shared__ float part[2][4];
+    const int64_t r = blockIdx.x >> 3;
+    const int t0 = cooperative_groups::this_cluster().block_rank() * 128 + threadIdx.x;
+    float v[kMaxPer];
+    float ss = 0.f;
+    int n = 0;
+    for (int d = t0; d < D; d += 1024, ++n) {
+        float t = y[r * D + d];
+        if (y2) t = t + y2[r * D + d];
+        if (scale) {
+            t = t * scale[d];
+            if (round_bf16) t = bf16r(t);
+        }
+        v[n] = t;
+        ss += t * t;
+    }
+    const float rs = rsqrtf(cluster_sum(ss, part[0]) / (float)D + post_eps);
+    float ss2 = 0.f;
+    n = 0;
+    for (int d = t0; d < D; d += 1024, ++n) {
+        const float yn = v[n] * rs;
+        const float h = res[r * D + d] * ab[d] + yn * ab[D + d];
+        res[r * D + d] = h;
+        v[n] = h;
+        ss2 += h * h;
+    }
+    const float rs2 = rsqrtf(cluster_sum(ss2, part[1]) / (float)D + next_eps);
+    n = 0;
+    for (int d = t0; d < D; d += 1024, ++n) {
+        const float o = v[n] * rs2 * w_next[d];
+        x[r * D + d] = __float2half_rn(o);
+        if (xf) xf[r * D + d] = o;
+    }
+    cooperative_groups::this_cluster().sync();  // no block leaves while another reads its partials
+}
+
 // Router logits in fp32: out[r, e] = x[r] . W[e] (F.linear(x.float(), router_weight)) on the fp32 normed input; W
 // bf16 or fp32.
-// Grid (E / 8, rows), 8 warps: a warp an expert.
+// Grid (E / warps, rows), a warp an expert (any warps a block: 2 spread one row over every SM). A lane sums its
+// columns d = lane + 32 j in order; the bf16 loop loads 8 columns ahead (the same sums, more loads in flight).
 extern "C" __global__ void muse_router(const float* __restrict__ x, const void* __restrict__ W, int w_bf16,
                                        float* __restrict__ out, int D, int E) {
     const int r = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int e = blockIdx.x * 8 + warp;
+    const int e = blockIdx.x * (blockDim.x >> 5) + warp;
     if (e >= E) return;
     const float* xr = x + (int64_t)r * D;
     float acc = 0.f;
     if (w_bf16) {
         const uint16_t* wr = (const uint16_t*)W + (int64_t)e * D;
-        for (int d = lane; d < D; d += 32) acc += xr[d] * __uint_as_float(((uint32_t)wr[d]) << 16);
+        int d = lane;
+        for (; d + 224 < D; d += 256) {
+            uint16_t wv[8];
+            float xv[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                wv[j] = __ldg(wr + d + 32 * j);
+                xv[j] = xr[d + 32 * j];
+            }
+#pragma unroll
+            for (int j = 0; j < 8; ++j) acc += xv[j] * __uint_as_float(((uint32_t)wv[j]) << 16);
+        }
+        for (; d < D; d += 32) acc += xr[d] * __uint_as_float(((uint32_t)wr[d]) << 16);
     } else {
         const float* wr = (const float*)W + (int64_t)e * D;
         for (int d = lane; d < D; d += 32) acc += xr[d] * wr[d];
@@ -229,6 +300,41 @@ extern "C" __global__ void muse_expert_sum(const float* __restrict__ y, const fl
     n = 0;
     for (int d = threadIdx.x; d < L; d += blockDim.x, ++n)
         if (d >= out_lo && d < out_lo + out_w) out[r * out_w + d - out_lo] = __float2half_rn(acc[n]);
+}
+
+// muse_expert_sum on a cluster of 8 blocks of 128 threads a row (grid rows * 8), muse_expert_sum's bits (as
+// muse_gate_norm_c). K <= 16.
+extern "C" __global__ void __cluster_dims__(8, 1, 1) __launch_bounds__(128)
+    muse_expert_sum_c(const float* __restrict__ y, const float* __restrict__ y2, const float* __restrict__ wts,
+                      const float* __restrict__ scale, float eps, __half* __restrict__ out, int L, int K, int out_lo,
+                      int out_w) {
+    __shared__ float part[16][4];
+    const int64_t r = blockIdx.x >> 3;
+    const int t0 = cooperative_groups::this_cluster().block_rank() * 128 + threadIdx.x;
+    float acc[kMaxPer];
+    float v[kMaxPer];
+    int n = 0;
+    for (int d = t0; d < L; d += 1024, ++n) acc[n] = 0.f;
+    for (int k = 0; k < K; ++k) {
+        const int64_t p = r * K + k;
+        float ss = 0.f;
+        n = 0;
+        for (int d = t0; d < L; d += 1024, ++n) {
+            float t = y[p * L + d];
+            if (y2) t = t + y2[p * L + d];
+            t = bf16r(t * scale[d]);
+            v[n] = t;
+            ss += t * t;
+        }
+        const float rs = rsqrtf(cluster_sum(ss, part[k]) / (float)L + eps);
+        const float wk = wts[p];
+        n = 0;
+        for (int d = t0; d < L; d += 1024, ++n) acc[n] = acc[n] + (v[n] * rs) * wk;
+    }
+    n = 0;
+    for (int d = t0; d < L; d += 1024, ++n)
+        if (d >= out_lo && d < out_lo + out_w) out[r * out_w + d - out_lo] = __float2half_rn(acc[n]);
+    cooperative_groups::this_cluster().sync();
 }
 
 // The head: x = x * mult, then cap * tanh(x / cap) when cap > 0 (Linear pre_scale, ext.softcap), in place.
