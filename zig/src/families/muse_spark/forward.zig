@@ -110,6 +110,9 @@ pub const Model = struct {
     nch_max: usize,
     kc: []u64,
     vc: []u64,
+    ks: []u64, // kv8: fp32 [slots, context, HK] key scales of a full layer (0: fp16 cache)
+    vs: []u64,
+    kv8: bool = false,
     cos: u64, // fp32 [context, 32] (one theta: every RoPE layer's)
     sin: u64,
     theta: f64,
@@ -119,6 +122,16 @@ pub const Model = struct {
     dr: ?*dflash2.Drafter = null, // fed inside run: taps after its layers, the context update after the last layer
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const Weights, k3: *const exl3.Kernels, comm: ?tp.Collective, context: usize, rows: usize, slots: usize, s: Stream) !Model {
+        return initKv(gpa, d, w, k3, comm, context, rows, slots, s, kv8Env());
+    }
+
+    /// TF_MUSE_KV8=1: the full layers' caches in e4m3 with a scale per (token, KV head).
+    pub fn kv8Env() bool {
+        const v = std.c.getenv("TF_MUSE_KV8") orelse return false;
+        return !std.mem.eql(u8, std.mem.span(v), "0");
+    }
+
+    pub fn initKv(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const Weights, k3: *const exl3.Kernels, comm: ?tp.Collective, context: usize, rows: usize, slots: usize, s: Stream, kv8: bool) !Model {
         const cfg = w.cfg;
         if (w.world > 1 and comm == null) return error.NeedComm;
         if (rows > DECODE_ROWS or rows == 0) return error.TooManyRows;
@@ -158,12 +171,19 @@ pub const Model = struct {
         const L = w.layers.len;
         const HK = cfg.kv_heads;
         const hd = cfg.head_dim;
+        m.kv8 = kv8;
         m.kc = try gpa.alloc(u64, L);
         m.vc = try gpa.alloc(u64, L);
+        m.ks = try gpa.alloc(u64, L);
+        m.vs = try gpa.alloc(u64, L);
         for (0..L) |i| {
             const n = if (cfg.full[i]) context else m.ring;
-            m.kc[i] = try ar.zeros(slots * n * HK * hd * 2);
-            m.vc[i] = try ar.zeros(slots * n * HK * hd * 2);
+            const q8 = kv8 and cfg.full[i];
+            const eb: usize = if (q8) 1 else 2;
+            m.kc[i] = try ar.zeros(slots * n * HK * hd * eb);
+            m.vc[i] = try ar.zeros(slots * n * HK * hd * eb);
+            m.ks[i] = if (q8) try ar.zeros(slots * n * HK * 4) else 0;
+            m.vs[i] = if (q8) try ar.zeros(slots * n * HK * 4) else 0;
         }
         // RoPE tables: every RoPE layer of Muse Spark has the same theta (5e5); refuse a second one
         m.theta = 0;
@@ -243,6 +263,8 @@ pub const Model = struct {
         m.graphs.deinit(m.gpa);
         m.gpa.free(m.kc);
         m.gpa.free(m.vc);
+        m.gpa.free(m.ks);
+        m.gpa.free(m.vs);
         m.glue.unload();
         m.attn.unload();
         m.arena.deinit();
@@ -402,6 +424,8 @@ pub const Model = struct {
             a.add(ci(H));
             a.add(ci(HK));
             a.add(@as(f32, @floatCast(cfg.eps)));
+            a.add(m.ks[i]);
+            a.add(m.vs[i]);
             try cuda.launch.launch(m.f_prep, .{ .grid = .{ .x = u(n), .y = u(H + HK), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &a);
         }
         const win: usize = if (full) 0 else cfg.window;
@@ -416,6 +440,8 @@ pub const Model = struct {
             a.add(ci(H));
             a.add(ci(HK));
             a.add(@as(f32, @floatCast(cfg.smScale())));
+            a.add(m.ks[i]);
+            a.add(m.vs[i]);
             try cuda.launch.launch(m.f_rows, .{ .grid = .{ .x = u(n), .y = u(HK), .z = u(nch) }, .block = .{ .x = 256, .y = 1, .z = 1 } }, s, &a);
         }
         {

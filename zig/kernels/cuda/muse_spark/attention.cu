@@ -4,9 +4,12 @@
 //   muse_attn_rows: a block per (row, KV head, key chunk): its 8 query heads as 8 warps over shared K / V tiles,
 //                   online softmax, partial (o, max, sum) per chunk
 //   muse_attn_merge: chunks merged, half output, weightless o_norm per head, times sigmoid(gate)
+// 8-bit caches (full layers, TF_MUSE_KV8=1): e4m3 keys and values with an fp32 scale per (token, KV head) (absmax /
+// 448); prep writes them, rows dequantise each tile to fp16 in shared memory (the fp16 path's arithmetic after it).
 
 #include <cstdint>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <math_constants.h>
 
 namespace {
@@ -27,6 +30,31 @@ constexpr int G = 8;      // query heads a KV head
 constexpr int TILE = 32;  // keys a tile
 constexpr int KP = 33;    // K tile row stride in 32-bit words (64 halves + 2): conflict-free row-per-lane reads
 
+// e4m3 of x / s (saturating), s = absmax / 448 over the warp's 64 values (lane: a = dim l, b = dim l + 32).
+__device__ __forceinline__ float fp8_store(float a, float b, uint8_t* dst, int lane) {
+    const float am = warp_max(fmaxf(fabsf(a), fabsf(b)));
+    const float sc = am > 0.f ? am / 448.f : 1.f;
+    const float inv = 1.f / sc;
+    dst[lane] = (uint8_t)__nv_cvt_float_to_fp8(a * inv, __NV_SATFINITE, __NV_E4M3);
+    dst[lane + 32] = (uint8_t)__nv_cvt_float_to_fp8(b * inv, __NV_SATFINITE, __NV_E4M3);
+    return sc;
+}
+
+// 8 e4m3 values (two words) times sc as 8 halves (four words).
+__device__ __forceinline__ uint4 fp8x8_to_half(uint2 w, float sc) {
+    uint32_t in[2] = {w.x, w.y};
+    uint32_t out[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const __nv_fp8x2_storage_t pr = (__nv_fp8x2_storage_t)((in[i >> 1] >> (16 * (i & 1))) & 0xFFFFu);
+        const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2(pr, __NV_E4M3);
+        const float2 f = __half22float2(*(const __half2*)&hr);
+        const __half2 h = __floats2half2_rn(f.x * sc, f.y * sc);
+        out[i] = *(const uint32_t*)&h;
+    }
+    return make_uint4(out[0], out[1], out[2], out[3]);
+}
+
 }  // namespace
 
 // Grid (rows, H + HK), a warp a head: q heads first, then KV heads (which also write v). Lane l holds dims l, l + 32.
@@ -36,7 +64,7 @@ extern "C" __global__ void muse_qk_prep(const __half* __restrict__ q, const __ha
                                         const float* __restrict__ sin_t, int rope, const int32_t* __restrict__ pos,
                                         const int32_t* __restrict__ slot, __half* __restrict__ qo,
                                         __half* __restrict__ kc, __half* __restrict__ vc, int LEN, int H, int HK,
-                                        float eps) {
+                                        float eps, float* __restrict__ ks, float* __restrict__ vs8) {
     const int r = blockIdx.x, h = blockIdx.y, lane = threadIdx.x;
     const bool is_q = h < H;
     const int kh = h - H;
@@ -58,6 +86,16 @@ extern "C" __global__ void muse_qk_prep(const __half* __restrict__ q, const __ha
         return;
     }
     const int64_t at = (((int64_t)slot[r] * LEN + p % LEN) * HK + kh) * HD;
+    if (ks) {  // 8-bit: kc / vc hold e4m3 bytes, one scale per (token, KV head)
+        const float sk = fp8_store(a, b, (uint8_t*)kc + at, lane);
+        const __half* vr = v + ((int64_t)r * HK + kh) * HD;
+        const float sv = fp8_store(__half2float(vr[lane]), __half2float(vr[lane + 32]), (uint8_t*)vc + at, lane);
+        if (lane == 0) {
+            ks[at / HD] = sk;
+            vs8[at / HD] = sv;
+        }
+        return;
+    }
     kc[at + lane] = __float2half_rn(a);
     kc[at + lane + 32] = __float2half_rn(b);
     const __half* vs = v + ((int64_t)r * HK + kh) * HD;
@@ -81,7 +119,7 @@ extern "C" __global__ void __launch_bounds__(256)
     muse_attn_rows(const __half* __restrict__ qo, const __half* __restrict__ kc, const __half* __restrict__ vc,
                    const int32_t* __restrict__ pos, const int32_t* __restrict__ slot, float* __restrict__ po,
                    float* __restrict__ pm, float* __restrict__ pl, int LEN, int NCH, int CK, int win, int H, int HK,
-                   float scale) {
+                   float scale, const float* __restrict__ ksc, const float* __restrict__ vsc) {
     __shared__ uint32_t ks[TILE * KP];
     __shared__ __half2 vs[TILE * 32];
     __shared__ float qs[G][HD];
@@ -116,8 +154,14 @@ extern "C" __global__ void __launch_bounds__(256)
             const int row = threadIdx.x >> 3, part = threadIdx.x & 7;  // a key row is 8 x 16 bytes
             if (t0 + row < end) {
                 const int64_t at = ((base + (t0 + row) % LEN) * HK + kvh) * HD + part * 8;
-                const uint4 kk = *(const uint4*)(kc + at);
-                const uint4 vv = *(const uint4*)(vc + at);
+                uint4 kk, vv;
+                if (ksc) {
+                    kk = fp8x8_to_half(*(const uint2*)((const uint8_t*)kc + at), ksc[at / HD]);
+                    vv = fp8x8_to_half(*(const uint2*)((const uint8_t*)vc + at), vsc[at / HD]);
+                } else {
+                    kk = *(const uint4*)(kc + at);
+                    vv = *(const uint4*)(vc + at);
+                }
                 uint32_t* kd = ks + row * KP + part * 4;
                 kd[0] = kk.x;
                 kd[1] = kk.y;

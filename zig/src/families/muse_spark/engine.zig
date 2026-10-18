@@ -14,11 +14,11 @@ pub const Op = enum(i64) { hello = 0x3A5E, forward = 1, draft = 2, stop = 3, pro
 
 /// What rank 0 announces first so every rank builds the same model.
 /// prompt_rows > 0: the prompt path (prompt.zig) with chunks of that many rows, experts in prompt_ewin-row windows.
-pub const Setup = struct { context: usize, slots: usize, drafts: bool = false, prompt_rows: usize = 0, prompt_ewin: usize = prompt_.EWIN, prompt_exact: bool = true };
+pub const Setup = struct { context: usize, slots: usize, drafts: bool = false, prompt_rows: usize = 0, prompt_ewin: usize = prompt_.EWIN, prompt_exact: bool = true, kv8: bool = false };
 
-/// The hello words: [hello, 6, context, slots, drafts, prompt rows, experts window, exact].
-pub fn hello(su: Setup) [8]i64 {
-    return .{ @backingInt(Op.hello), 6, @intCast(su.context), @intCast(su.slots), @intFromBool(su.drafts), @intCast(su.prompt_rows), @intCast(su.prompt_ewin), @intFromBool(su.prompt_exact) };
+/// The hello words: [hello, 7, context, slots, drafts, prompt rows, experts window, exact, kv8].
+pub fn hello(su: Setup) [9]i64 {
+    return .{ @backingInt(Op.hello), 7, @intCast(su.context), @intCast(su.slots), @intFromBool(su.drafts), @intCast(su.prompt_rows), @intCast(su.prompt_ewin), @intFromBool(su.prompt_exact), @intFromBool(su.kv8) };
 }
 
 /// The setup a follower reads from rank 0's hello.
@@ -30,6 +30,7 @@ pub fn setupOf(words: []const i64) !Setup {
         su.prompt_ewin = @intCast(words[6]);
         su.prompt_exact = words[7] != 0;
     }
+    if (words.len >= 9) su.kv8 = words[8] != 0;
     return su;
 }
 
@@ -40,6 +41,7 @@ pub fn promptEnv(su: *Setup) void {
     su.prompt_rows = if (on) envUsize("TF_MUSE_PROMPT_ROWS", prompt_.CAP) else 0;
     su.prompt_ewin = envUsize("TF_MUSE_PROMPT_EWIN", prompt_.EWIN);
     su.prompt_exact = envUsize("TF_MUSE_PROMPT_EXACT", 1) != 0;
+    su.kv8 = fwd.Model.kv8Env();
 }
 
 pub fn envUsize(name: [*:0]const u8, default: usize) usize {
@@ -94,7 +96,8 @@ pub const Engine = struct {
         e.k3 = try cuda.exl3.Kernels.load(d);
         errdefer e.k3.deinit();
         const comm = if (session) |ss| ss.comm() else null;
-        e.model = try fwd.Model.init(gpa, d, &e.w, &e.k3, comm, su.context, fwd.DECODE_ROWS, su.slots, e.s);
+        e.model = try fwd.Model.initKv(gpa, d, &e.w, &e.k3, comm, su.context, fwd.DECODE_ROWS, su.slots, e.s, su.kv8);
+        if (rank == 0 and su.kv8) std.log.info("muse kv8: full layers' caches in e4m3 (a scale per token and KV head)", .{});
         errdefer e.model.deinit();
         if (su.drafts) {
             const ddir = try drafterDir(gpa, dir);
@@ -212,7 +215,7 @@ test "the hello carries the setup" {
     try std.testing.expectEqual(su, try setupOf(&hello(su)));
     const plain: Setup = .{ .context = 65536, .slots = 2 };
     try std.testing.expectEqual(plain, try setupOf(&hello(plain)));
-    const pp: Setup = .{ .context = 32768, .slots = 4, .drafts = true, .prompt_rows = 1024, .prompt_ewin = 256, .prompt_exact = false };
+    const pp: Setup = .{ .context = 32768, .slots = 4, .drafts = true, .prompt_rows = 1024, .prompt_ewin = 256, .prompt_exact = false, .kv8 = true };
     try std.testing.expectEqual(pp, try setupOf(&hello(pp)));
     try std.testing.expectEqual(plain, try setupOf(&.{ @backingInt(Op.hello), 2, 65536, 2 })); // an older rank 0
     try std.testing.expectError(error.NoHello, setupOf(&.{ 3, 0 }));
