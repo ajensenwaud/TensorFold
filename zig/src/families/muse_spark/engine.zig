@@ -91,7 +91,7 @@ pub const Engine = struct {
         const world: usize = if (session) |ss| ss.cfg.world else 1;
         e.s = try cuda.Stream.init(d, false);
         errdefer e.s.deinit();
-        e.w = try load_.load(gpa, io, d, dir, rank, world, .{ .log = rank == 0 });
+        e.w = try load_.load(gpa, io, d, dir, rank, world, .{ .log = rank == 0, .embed_host = load_.embedHostEnv() });
         errdefer e.w.deinit();
         e.k3 = try cuda.exl3.Kernels.load(d);
         errdefer e.k3.deinit();

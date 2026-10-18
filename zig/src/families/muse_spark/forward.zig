@@ -30,6 +30,21 @@ pub fn chunkKeys(bucket: usize) usize {
     return @max(CK, std.mem.alignForward(usize, (bucket + MAX_CHUNKS - 1) / MAX_CHUNKS, CK));
 }
 
+/// linear_multi.cu's instantiations (EXL3 bits a weight; mul1 codebook, 4 warps).
+pub const multi_k2s = [_]u32{ 2, 3, 4, 5, 6, 8 };
+
+/// TF_MUSE_FAST (default on; 0 = the original launches): q / k / v / gate in one launch, the router on 2-warp blocks.
+pub fn fastEnv() bool {
+    const v = std.c.getenv("TF_MUSE_FAST") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+/// TF_MUSE_OVERLAP=1: the router and top-k on a side stream, overlapping the latent projection and its gather.
+pub fn overlapEnv() bool {
+    const v = std.c.getenv("TF_MUSE_OVERLAP") orelse return false;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
 /// Key chunks a full layer's row at position pos reads eagerly (its own chunk width).
 pub fn rowChunks(context: usize, pos: usize) usize {
     return pos / chunkKeys(bucketOf(context, pos + 1)) + 1;
@@ -67,6 +82,8 @@ const Bufs = struct {
     pm: u64,
     pl: u64,
     xh: u64, // f16 rot_in scratch [R, max K]
+    xh4: u64, // f16 [4, R, D]: q / k / v / gate's rotated inputs (one launch)
+    z4: u64, // f32: their split partials, one region each
     z: u64, // f32 split partials
     part: u64, // f32 [R, D]
     logits: u64, // f32 [R, E]
@@ -79,6 +96,8 @@ const Bufs = struct {
     recv: u64, // f32 [world, R, max(D, K * latent, head stride)]: all-gathers
     latg: u64, // f16 [world, R, latent / world]: the gathered latent halves
     am: u64, // i32 [R]
+    erow: u64, // bf16 [R, D]: the window's embedding rows (embed_host), read through iota
+    iota: u64, // i64 [R]: 0 .. R - 1
     sc: exl3.Scratch,
 };
 
@@ -89,9 +108,16 @@ pub const Model = struct {
     comm: ?tp.Collective,
     glue: cuda.Module,
     attn: cuda.Module,
+    lin: cuda.Module, // linear_multi.cu: q / k / v / gate in one launch (TF_MUSE_FAST)
+    f_multi: [multi_k2s.len]cuda.Function,
+    f_rotm: cuda.Function,
+    f_lin2: [multi_k2s.len][2]cuda.Function, // linear_body2 (32-row passes, the same bits) at 4 and 8 warps
+    fast: bool,
     f_embed: cuda.Function,
     f_rms: cuda.Function,
     f_gate: cuda.Function,
+    f_gate_c: cuda.Function, // the cluster versions (8 blocks a row, the same bits): TF_MUSE_FAST
+    f_esum_c: cuda.Function,
     f_router: cuda.Function,
     f_topk: cuda.Function,
     f_esum: cuda.Function,
@@ -119,7 +145,11 @@ pub const Model = struct {
     b: Bufs,
     arena: load_.Arena,
     gpa: std.mem.Allocator,
+    h_erow: []u16 = &.{}, // embed_host: host staging of the window's rows
     dr: ?*dflash2.Drafter = null, // fed inside run: taps after its layers, the context update after the last layer
+    side: ?Stream = null, // TF_MUSE_OVERLAP: router + top-k on a second stream beside the latent projection and gather
+    ev_fork: ?cuda.Event = null,
+    ev_join: ?cuda.Event = null,
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const Weights, k3: *const exl3.Kernels, comm: ?tp.Collective, context: usize, rows: usize, slots: usize, s: Stream) !Model {
         return initKv(gpa, d, w, k3, comm, context, rows, slots, s, kv8Env());
@@ -150,6 +180,14 @@ pub const Model = struct {
         m.nch_max = @max(@min(MAX_CHUNKS, (context + CK - 1) / CK), (cfg.window + 1 + CK - 1) / CK);
         m.gpa = gpa;
         m.dr = null;
+        m.side = null;
+        m.ev_fork = null;
+        m.ev_join = null;
+        if (overlapEnv()) {
+            m.side = try Stream.init(d, false);
+            m.ev_fork = try cuda.Event.init(d, false);
+            m.ev_join = try cuda.Event.init(d, false);
+        }
         m.arena = .{ .d = d, .gpa = gpa };
         errdefer m.arena.deinit();
         m.glue = try cuda.Module.load(d, cuda.kernels.muse_glue);
@@ -159,6 +197,8 @@ pub const Model = struct {
         m.f_embed = try m.glue.function("muse_embed_norm");
         m.f_rms = try m.glue.function("muse_rms");
         m.f_gate = try m.glue.function("muse_gate_norm");
+        m.f_gate_c = try m.glue.function("muse_gate_norm_c");
+        m.f_esum_c = try m.glue.function("muse_expert_sum_c");
         m.f_router = try m.glue.function("muse_router");
         m.f_topk = try m.glue.function("muse_topk");
         m.f_esum = try m.glue.function("muse_expert_sum");
@@ -167,6 +207,14 @@ pub const Model = struct {
         m.f_prep = try m.attn.function("muse_qk_prep");
         m.f_rows = try m.attn.function("muse_attn_rows");
         m.f_merge = try m.attn.function("muse_attn_merge");
+        m.lin = try cuda.Module.load(d, cuda.kernels.muse_linear);
+        errdefer m.lin.unload();
+        inline for (multi_k2s, 0..) |k2, j| m.f_multi[j] = try m.lin.function(std.fmt.comptimePrint("muse_linear_multi_k{d}", .{k2}));
+        m.f_rotm = try m.lin.function("muse_rot_multi");
+        inline for (multi_k2s, 0..) |k2, j| inline for (.{ 4, 8 }, 0..) |wk, q| {
+            m.f_lin2[j][q] = try m.lin.function(std.fmt.comptimePrint("muse_linear2_k{d}_w{d}", .{ k2, wk }));
+        };
+        m.fast = fastEnv();
         const ar = &m.arena;
         const L = w.layers.len;
         const HK = cfg.kv_heads;
@@ -231,6 +279,10 @@ pub const Model = struct {
         b.pl = try ar.zeros(R * cfg.heads * m.nch_max * 4);
         b.xh = try ar.zeros(R * @max(D, HQ) * 2);
         b.z = try ar.zeros(@max(max_z, 4));
+        var z4: usize = 0;
+        for (w.layers) |ly| z4 = @max(z4, zBytes(ly.q, R) + zBytes(ly.k, R) + zBytes(ly.v, R) + zBytes(ly.g, R));
+        b.xh4 = try ar.zeros(4 * R * D * 2);
+        b.z4 = try ar.zeros(@max(z4, 4));
         b.part = try ar.zeros(R * D * 4);
         b.logits = try ar.zeros(R * cfg.experts * 4);
         b.pick = try ar.zeros(R * cfg.top_k * 4);
@@ -242,6 +294,14 @@ pub const Model = struct {
         b.recv = if (w.world > 1) try ar.zeros(w.world * R * @max(@max(D, cfg.top_k * lat), vr) * 4) else 0;
         b.latg = if (w.world > 1) try ar.zeros(R * lat * 2) else 0;
         b.am = try ar.zeros(R * 4);
+        b.erow = if (w.embed == 0) try ar.zeros(R * D * 2) else 0;
+        {
+            const io_ = try gpa.alloc(i64, R);
+            defer gpa.free(io_);
+            for (io_, 0..) |*x, j| x.* = @intCast(j);
+            b.iota = try ar.upload(std.mem.sliceAsBytes(io_));
+        }
+        m.h_erow = if (w.embed == 0) try gpa.alloc(u16, R * D) else &.{};
         const first = w.layers[0].experts;
         const cfg_gu = try exl3.defaultConfig(first.dims, first.width, true);
         const cfg_d = try exl3.defaultConfig(first.width, first.dims, false);
@@ -258,6 +318,9 @@ pub const Model = struct {
     }
 
     pub fn deinit(m: *Model) void {
+        if (m.side) |*sd| sd.deinit();
+        if (m.ev_fork) |*e| e.deinit();
+        if (m.ev_join) |*e| e.deinit();
         var it = m.graphs.valueIterator();
         while (it.next()) |e| e.deinit();
         m.graphs.deinit(m.gpa);
@@ -265,8 +328,10 @@ pub const Model = struct {
         m.gpa.free(m.vc);
         m.gpa.free(m.ks);
         m.gpa.free(m.vs);
+        if (m.h_erow.len > 0) m.gpa.free(m.h_erow);
         m.glue.unload();
         m.attn.unload();
+        m.lin.unload();
         m.arena.deinit();
     }
 
@@ -297,9 +362,24 @@ pub const Model = struct {
         }
         for (per[0..m.slots]) |c| if (c + m.w.cfg.window + 1 > m.ring) return error.RingOverrun;
         const n = rows.len;
+        if (m.w.embed == 0) try m.embedRows(ids[0..n], m.h_erow, m.b.erow);
         try upload(m.d, m.b.ids, std.mem.sliceAsBytes(ids[0..n]));
         try upload(m.d, m.b.pos, std.mem.sliceAsBytes(pos[0..n]));
         try upload(m.d, m.b.slot, std.mem.sliceAsBytes(slot[0..n]));
+    }
+
+    /// embed_host: the tokens' table rows (bf16) through host staging `h` into `dev` [n, D].
+    pub fn embedRows(m: *const Model, tokens: []const i64, h: []u16, dev: u64) !void {
+        const D = m.w.full.hidden;
+        const tab = m.w.embed_host;
+        if (h.len < tokens.len * D) return error.WindowTooWide;
+        for (tokens, 0..) |t, j| @memcpy(std.mem.sliceAsBytes(h[j * D ..][0..D]), tab[@as(usize, @intCast(t)) * D * 2 ..][0 .. D * 2]);
+        try upload(m.d, dev, std.mem.sliceAsBytes(h[0 .. tokens.len * D]));
+    }
+
+    /// The embedding launch's (table, ids): the GPU table and the token ids, or the staged rows and iota.
+    pub fn embedSrc(m: *const Model, ids: u64, erow: u64, iota: u64) [2]u64 {
+        return if (m.w.embed != 0) .{ m.w.embed, ids } else .{ erow, iota };
     }
 
     /// Eager decode window: softcapped fp32 logits of every row into `out` [n, vocab] (or none).
@@ -392,12 +472,101 @@ pub const Model = struct {
         a.add(x);
         a.add(xf);
         a.add(ci(cfg.hidden));
-        try cuda.launch.launch(m.f_gate, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = NORM_THREADS, .y = 1, .z = 1 } }, s, &a);
+        try m.rowLaunch(m.f_gate, m.f_gate_c, cfg.hidden, n, s, &a);
+    }
+
+    const Job = extern struct { xh: u64, t: u64, stride_k: i64, stride_nb: i64, svh: u64, bias: u64, y: u64, z: u64, counters: u64, y_dtype: c_int, k: c_int, n: c_int, sk: c_int, b0: c_int, pad: c_int = 0 };
+    const Batch = extern struct { j: [4]Job, n: c_int, m: c_int, pad: [2]c_int = .{ 0, 0 } };
+    const Rot = extern struct { suh: [4]u64, xh: [4]u64 };
+
+    /// q, k, v and gate of n rows (fp16 out): one rot_in and one linear launch (linear_multi.cu, linear_kernel's
+    /// bits) when TF_MUSE_FAST and the four share a width and the 4-warp plan, else four projections.
+    pub fn qkvg(m: *Model, s: Stream, L: load_.Layer, x: u64, q: u64, k: u64, v: u64, g: u64, n: usize) !void {
+        const ls = [4]exl3.Linear{ L.q, L.k, L.v, L.g };
+        const outs = [4]u64{ q, k, v, g };
+        var ok = m.fast and n <= 16; // wider windows: proj's 32-row passes
+        const fi = std.mem.indexOfScalar(u32, &multi_k2s, L.q.k2);
+        if (fi == null) ok = false;
+        for (ls) |l| if (l.k2 != L.q.k2 or l.split[1] != 4 or l.k != L.q.k or l.bias != 0) {
+            ok = false;
+        };
+        if (!ok) {
+            for (ls, outs) |l, o| try m.proj(s, l, x, o, false, n);
+            return;
+        }
+        const K = L.q.k;
+        const D = m.w.cfg.hidden;
+        var rot: Rot = undefined;
+        var bt: Batch = .{ .j = undefined, .n = 4, .m = ci(n) };
+        var b0: usize = 0;
+        var zat = m.b.z4;
+        for (ls, outs, 0..) |l, o, j| {
+            rot.suh[j] = l.suh;
+            rot.xh[j] = m.b.xh4 + j * m.rows * D * 2;
+            const st = l.strides();
+            const sk = l.split[0];
+            bt.j[j] = .{ .xh = rot.xh[j], .t = l.words, .stride_k = st[0], .stride_nb = st[1], .svh = l.svh, .bias = 0, .y = o, .z = if (sk > 1) zat else 0, .counters = l.counters, .y_dtype = 0, .k = ci(l.k), .n = ci(l.n), .sk = ci(sk), .b0 = ci(b0) };
+            if (sk > 1) zat += sk * n * l.n * 4;
+            b0 += (l.n / 128) * sk;
+        }
+        {
+            var a: cuda.Args = .{};
+            a.add(x);
+            a.add(@as(c_int, 0));
+            a.add(rot);
+            a.add(ci(K));
+            try cuda.launch.launch(m.f_rotm, .{ .grid = .{ .x = u(((K / 128) + 3) / 4), .y = u(n), .z = 4 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &a);
+        }
+        const f = m.f_multi[fi.?];
+        const smem: u32 = u(4 * @as(usize, @min(n, 8)) * 128 * 4);
+        var a: cuda.Args = .{};
+        a.add(bt);
+        try cuda.launch.launch(f, .{ .grid = .{ .x = u(b0), .y = 1, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 }, .shared = smem }, s, &a);
+    }
+
+    /// Graphs captured so far (a lever switched at run time must not replay graphs captured before it).
+    pub fn dropGraphs(m: *Model) void {
+        var it = m.graphs.valueIterator();
+        while (it.next()) |e| e.deinit();
+        m.graphs.clearRetainingCapacity();
+    }
+
+    /// A block-a-row glue kernel (1024 threads) or, with TF_MUSE_FAST, its cluster twin (8 x 128 threads a row).
+    pub fn rowLaunch(m: *const Model, f: cuda.Function, fc: cuda.Function, width: usize, n: usize, s: Stream, a: *cuda.Args) !void {
+        if (m.fast and width <= 16 * NORM_THREADS) {
+            try cuda.launch.launch(fc, .{ .grid = .{ .x = u(n * 8), .y = 1, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, a);
+        } else try cuda.launch.launch(f, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = NORM_THREADS, .y = 1, .z = 1 } }, s, a);
     }
 
     /// An EXL3 projection of n rows: x [n, K] fp16 -> out [n, N] fp16 or fp32.
     pub fn proj(m: *Model, s: Stream, l: exl3.Linear, x: u64, out: u64, out_f32: bool, n: usize) !void {
-        try m.k3.linear(s, l, x, .f16, m.b.xh, out, if (out_f32) .f32 else .f16, if (l.split[0] > 1) m.b.z else 0, n);
+        const z = if (l.split[0] > 1) m.b.z else 0;
+        const ki = std.mem.indexOfScalar(u32, &multi_k2s, l.k2);
+        const wi: ?usize = if (l.split[1] == 4) 0 else if (l.split[1] == 8) 1 else null;
+        if (!m.fast or n <= 16 or ki == null or wi == null or n > 128) {
+            return m.k3.linear(s, l, x, .f16, m.b.xh, out, if (out_f32) .f32 else .f16, z, n);
+        }
+        // linear_kernel's launch on linear_body2 (32-row passes): exl3.zig linearRows' arguments and grid
+        try m.k3.linearRotIn(s, x, .f16, l.suh, m.b.xh, n, l.k);
+        const sk, const wk = l.split;
+        if ((l.k / 16) % (sk * wk) != 0) return error.KSplit;
+        const f = m.f_lin2[ki.?][wi.?];
+        const smem: u32 = u(wk * @as(usize, @min(n, 8)) * 128 * 4);
+        if (smem > 48 * 1024) try f.allowDynamicShared(smem);
+        const st = l.strides();
+        var a: cuda.Args = .{};
+        inline for (.{ m.b.xh, l.words }) |p| a.add(p);
+        a.add(st[0]);
+        a.add(st[1]);
+        inline for (.{ l.svh, l.bias, out }) |p| a.add(p);
+        a.add(@as(c_int, if (out_f32) 2 else 0));
+        a.add(z);
+        a.add(l.counters);
+        a.add(ci(n));
+        a.add(ci(l.k));
+        a.add(ci(l.n));
+        a.add(ci(sk));
+        try cuda.launch.launch(f, .{ .grid = .{ .x = u(l.n / 128), .y = u(sk), .z = 1 }, .block = .{ .x = u(wk * 32), .y = 1, .z = 1 }, .shared = smem }, s, &a);
     }
 
     /// A window's attention buffers: q, k, v, g in; qo scratch; att out; the rows' positions and slots.
@@ -463,6 +632,11 @@ pub const Model = struct {
         const cfg = m.w.cfg;
         const E = cfg.experts;
         const K = cfg.top_k;
+        const rs = if (m.side) |sd| sd else s; // the router's stream: forked here, joined before the experts
+        if (m.side) |sd| {
+            try m.ev_fork.?.record(s);
+            try sd.wait(m.ev_fork.?);
+        }
         {
             var a: cuda.Args = .{};
             a.add(m.b.xf);
@@ -471,7 +645,8 @@ pub const Model = struct {
             a.add(m.b.logits);
             a.add(ci(cfg.hidden));
             a.add(ci(E));
-            try cuda.launch.launch(m.f_router, .{ .grid = .{ .x = u((E + 7) / 8), .y = u(n), .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, s, &a);
+            const rw: usize = if (m.fast) 2 else 8; // 2 warps a block spread one row's 256 experts over every SM
+            try cuda.launch.launch(m.f_router, .{ .grid = .{ .x = u((E + rw - 1) / rw), .y = u(n), .z = 1 }, .block = .{ .x = u(32 * rw), .y = 1, .z = 1 } }, rs, &a);
         }
         {
             var a: cuda.Args = .{};
@@ -484,14 +659,16 @@ pub const Model = struct {
             a.add(m.b.pick);
             a.add(m.b.wts);
             const t = std.math.ceilPowerOfTwo(usize, @max(E, 32)) catch unreachable;
-            try cuda.launch.launch(m.f_topk, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = u(t), .y = 1, .z = 1 } }, s, &a);
+            try cuda.launch.launch(m.f_topk, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = u(t), .y = 1, .z = 1 } }, rs, &a);
         }
+        if (m.side) |sd| try m.ev_join.?.record(sd);
         try m.proj(s, L.pre, m.b.x, m.b.lat, false, n);
         if (m.comm) |c| {
             const half = L.pre.n; // this rank's latent outputs
             try c.allGather(m.b.lat, m.b.latg, n * half, .f16, s.handle);
             try m.normParts(s, m.b.latg, true, L.pre_norm, m.b.latn, n, cfg.latent, cfg.eps, half);
         } else try m.norm(s, m.b.lat, true, L.pre_norm, m.b.latn, n, cfg.latent, cfg.eps);
+        if (m.side != null) try s.wait(m.ev_join.?);
         // routed experts: group, rotate, gate / up, SwiGLU (fp32), down; per-slot outputs in sc.y [n * K, latent]
         const k3 = m.k3;
         const e = L.experts;
@@ -519,7 +696,7 @@ pub const Model = struct {
             a.add(ci(K));
             a.add(ci(m.w.rank * L.post.k)); // this rank's post_expert_proj inputs
             a.add(ci(L.post.k));
-            try cuda.launch.launch(m.f_esum, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = NORM_THREADS, .y = 1, .z = 1 } }, s, &a);
+            try m.rowLaunch(m.f_esum, m.f_esum_c, cfg.latent, n, s, &a);
         }
         try m.proj(s, L.post, m.b.acc, m.b.part, true, n);
     }
@@ -531,8 +708,9 @@ pub const Model = struct {
         if (chunks > m.nch_max) return error.TooManyChunks;
         {
             var a: cuda.Args = .{};
-            a.add(m.w.embed);
-            a.add(m.b.ids);
+            const es = m.embedSrc(m.b.ids, m.b.erow, m.b.iota);
+            a.add(es[0]);
+            a.add(es[1]);
             a.add(m.b.res);
             a.add(ci(D));
             a.add(@as(f32, @floatCast(cfg.eps)));
@@ -544,10 +722,7 @@ pub const Model = struct {
                 try c.hook(c.ctx, .input, i, m.b.res, n);
                 try m.norm(s, m.b.res, false, L.in_norm, m.b.x, n, D, cfg.eps);
             };
-            try m.proj(s, L.q, m.b.x, m.b.q, false, n);
-            try m.proj(s, L.k, m.b.x, m.b.k, false, n);
-            try m.proj(s, L.v, m.b.x, m.b.v, false, n);
-            try m.proj(s, L.g, m.b.x, m.b.g, false, n);
+            try m.qkvg(s, L, m.b.x, m.b.q, m.b.k, m.b.v, m.b.g, n);
             try m.attention(s, i, n, chunks);
             try m.proj(s, L.o, m.b.att, m.b.part, true, n);
             try m.gateNorm(s, m.b.part, 0, L.attn_ab, L.ffn_norm, m.b.xf, n);

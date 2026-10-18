@@ -85,7 +85,8 @@ pub const Drafter = struct {
     vc: []u64,
     cos: u64,
     sin: u64,
-    b: struct { tapbuf: u64, ctx16: u64, ctxg: u64, ctx: u64, kb: u64, vb: u64, xh: u64, z: u64, x32: u64, h: u64, c16: u64, dyn: u64, q16: u64, q32: u64, a: u64, part: u64, recv: u64, gb: u64, ub: u64, mm: u64, tk: u64, head: u64, top: u64, topg: u64, sg: u64, am: u64, in_tok: u64, in_pos0: u64, in_slot: u64, rpos: u64, rslot: u64 },
+    b: struct { tapbuf: u64, ctx16: u64, ctxg: u64, ctx: u64, kb: u64, vb: u64, xh: u64, z: u64, x32: u64, h: u64, c16: u64, dyn: u64, q16: u64, q32: u64, a: u64, part: u64, recv: u64, gb: u64, ub: u64, mm: u64, tk: u64, head: u64, top: u64, topg: u64, sg: u64, am: u64, in_tok: u64, in_pos0: u64, in_slot: u64, rpos: u64, rslot: u64, anc: u64, anc_idx: u64 },
+    h_anc: []u16 = &.{}, // the target's embed_host: the anchors' rows staged here (anc bf16 [streams, D], anc_idx iota)
     drafts: usize = 0,
     graphs: [MAX_STREAMS + 1]?cuda.graph.Exec = @splat(null),
 
@@ -148,6 +149,7 @@ pub const Drafter = struct {
             e.deinit();
             g.* = null;
         };
+        if (dr.h_anc.len > 0) gpa.free(dr.h_anc);
         gpa.free(dr.taps);
         gpa.free(dr.layers);
         gpa.free(dr.kc);
@@ -208,7 +210,9 @@ pub const Drafter = struct {
             const D = full.hidden;
             const row = try gpa.alloc(u16, D);
             defer gpa.free(row);
-            try dr.d.check(dr.d.api.cuMemcpyDtoH_v2(@ptrCast(row.ptr), dr.m.w.embed + full.mask_id * D * 2, D * 2), "mask row");
+            if (dr.m.w.embed == 0) {
+                @memcpy(std.mem.sliceAsBytes(row), dr.m.w.embed_host[full.mask_id * D * 2 ..][0 .. D * 2]);
+            } else try dr.d.check(dr.d.api.cuMemcpyDtoH_v2(@ptrCast(row.ptr), dr.m.w.embed + full.mask_id * D * 2, D * 2), "mask row");
             const f = try gpa.alloc(f32, D);
             defer gpa.free(f);
             for (row, f) |x, *o| o.* = @bitCast(@as(u32, x) << 16);
@@ -292,6 +296,13 @@ pub const Drafter = struct {
         b.in_slot = try ar.zeros(dr.streams * 4);
         b.rpos = try ar.zeros(SB * 4);
         b.rslot = try ar.zeros(SB * 4);
+        b.anc = if (m.w.embed == 0) try ar.zeros(dr.streams * D * 2) else 0;
+        {
+            var io_: [MAX_STREAMS]i64 = undefined;
+            for (&io_, 0..) |*x, j| x.* = @intCast(j);
+            b.anc_idx = try ar.upload(std.mem.sliceAsBytes(io_[0..dr.streams]));
+        }
+        if (m.w.embed == 0) dr.h_anc = try dr.gpa.alloc(u16, dr.streams * D);
     }
 
     /// Device bytes the drafter holds on this rank (weights, caches, scratch).
@@ -453,6 +464,7 @@ pub const Drafter = struct {
         }
         const d = dr.d;
         try d.check(d.api.cuMemcpyHtoD_v2(dr.b.in_tok, std.mem.sliceAsBytes(tokens).ptr, S * 8), "draft in");
+        if (dr.m.w.embed == 0) try dr.m.embedRows(tokens, dr.h_anc, dr.b.anc);
         try d.check(d.api.cuMemcpyHtoD_v2(dr.b.in_pos0, @ptrCast(&pz), S * 4), "draft in");
         try d.check(d.api.cuMemcpyHtoD_v2(dr.b.in_slot, @ptrCast(&sz), S * 4), "draft in");
         try d.check(d.api.cuMemcpyHtoD_v2(dr.b.rpos, @ptrCast(&rp), S * dr.block * 4), "draft in");
@@ -469,7 +481,8 @@ pub const Drafter = struct {
         const bb = &dr.b;
         {
             var a: cuda.Args = .{};
-            inline for (.{ m.w.embed, dr.mask_emb, bb.in_tok, bb.x32 }) |p| a.add(p);
+            const es = m.embedSrc(bb.in_tok, bb.anc, bb.anc_idx);
+            inline for (.{ es[0], dr.mask_emb, es[1], bb.x32 }) |p| a.add(p);
             a.add(ci(B));
             a.add(ci(D));
             try launch(dr.f.embed, s, n, 1, 256, &a);

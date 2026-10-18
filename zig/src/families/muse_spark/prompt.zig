@@ -55,6 +55,11 @@ pub const Prompt = struct {
     acc: u64, // f16 [cap, post inputs]
     sc: exl3.Scratch, // the grouped kernel's for ewin rows; y over xg / xu / xd, z = big
     taps: u64, // drafter: the chunk's taps, f16 [cap, taps, D]
+    erow: u64, // embed_host: bf16 [cap, D] rows, read through iota (i64 [cap])
+    iota: u64,
+    h_erow: []u16,
+    x2: cuda.Module, // experts2.cu: the grouped kernel with 32-member tiles (TF_MUSE_FAST; grouped_kernel's bits)
+    f_x2: [exl3.grouped_cfgs.len][exl3.grouped_ranges.len]cuda.Function,
     h_ids: []i64,
     h_pos: []i32,
     h_slot: []i32,
@@ -75,6 +80,11 @@ pub const Prompt = struct {
         pr.exact = exact;
         pr.ar = .{ .d = m.d, .gpa = gpa };
         errdefer pr.ar.deinit();
+        pr.x2 = try cuda.Module.load(m.d, cuda.kernels.muse_experts2);
+        errdefer pr.x2.unload();
+        inline for (exl3.grouped_cfgs, 0..) |c, i| inline for (exl3.grouped_ranges, 0..) |r, j| {
+            pr.f_x2[i][j] = try pr.x2.function(std.fmt.comptimePrint("muse_grouped2_{d}_{d}_{d}_{d}_{d}", .{ c[0], c[1], c[2], r[0], r[1] }));
+        };
         const ar = &pr.ar;
         const R = cap;
         const D = cfg.hidden;
@@ -103,6 +113,15 @@ pub const Prompt = struct {
         pr.sc = .{ .xg = front, .xu = front + sz.xg, .xd = front + 2 * sz.xg, .z = pr.big, .y = front, .ids = try ar.zeros(sz.ids), .count = try ar.zeros(4), .members = try ar.alloc(sz.members), .rows = ewin, .slots = cfg.top_k, .cfg_gu = cfg_gu, .cfg_d = cfg_d };
         try m.d.check(m.d.api.cuMemsetD32_v2(pr.sc.members, 0xFFFF_FFFF, sz.members / 4), "members -1");
         pr.taps = if (m.dr) |dr| try ar.zeros(R * dr.taps.len * D * 2) else 0;
+        pr.erow = if (w.embed == 0) try ar.zeros(R * D * 2) else 0;
+        {
+            const io_ = try gpa.alloc(i64, R);
+            defer gpa.free(io_);
+            for (io_, 0..) |*x, j| x.* = @intCast(j);
+            pr.iota = try ar.upload(std.mem.sliceAsBytes(io_));
+        }
+        pr.h_erow = if (w.embed == 0) try gpa.alloc(u16, R * D) else &.{};
+        errdefer if (pr.h_erow.len > 0) gpa.free(pr.h_erow);
         pr.h_ids = try gpa.alloc(i64, R);
         errdefer gpa.free(pr.h_ids);
         pr.h_pos = try gpa.alloc(i32, R);
@@ -113,15 +132,33 @@ pub const Prompt = struct {
     }
 
     pub fn deinit(pr: *Prompt) void {
+        if (pr.h_erow.len > 0) pr.gpa.free(pr.h_erow);
         pr.gpa.free(pr.h_ids);
         pr.gpa.free(pr.h_pos);
         pr.gpa.free(pr.h_slot);
+        pr.x2.unload();
         pr.ar.deinit();
         pr.gpa.destroy(pr);
     }
 
     pub fn bytes(pr: *const Prompt) usize {
         return pr.ar.total;
+    }
+
+    /// k3.grouped's launch, or with TF_MUSE_FAST its 32-member-tile twin (experts2.cu, the same bits).
+    fn grouped(pr: *Prompt, s: Stream, g: exl3.Kernels.GroupedArgs) !void {
+        if (!pr.m.fast) return pr.m.k3.grouped(s, g);
+        if (g.k % (16 * g.sk * g.warps) != 0 or g.n % (16 * g.nt) != 0) return error.UnevenSplit;
+        var ci_: ?usize = null;
+        for (exl3.grouped_cfgs, 0..) |c, i| if (c[0] == g.nt and c[1] == g.warps and c[2] == g.pf) {
+            ci_ = i;
+        };
+        const f = pr.f_x2[ci_ orelse return error.UnsupportedTile][exl3.rangeIndex(g.lo, g.hi)];
+        const mt = (g.maxm + 31) / 32;
+        var a: cuda.Args = .{};
+        inline for (.{ g.x0, g.x1, g.tp0, g.tp1, g.k2_0, g.k2_1, g.uids, g.ucount, g.members, g.z }) |p| a.add(p);
+        inline for (.{ g.k, g.n, g.p, g.sk, g.maxm, g.slots }) |v| a.add(ci(v));
+        try cuda.launch.launch(f, .{ .grid = .{ .x = u(g.nexp_max), .y = u(g.n / (16 * g.nt)), .z = u(g.mats * g.sk * mt) }, .block = .{ .x = g.warps * 32, .y = 1, .z = 1 } }, s, &a);
     }
 
     /// The ranks' fp32 partials [count] gathered into big (rank-major); (rank 0's, rank 1's or 0).
@@ -149,10 +186,7 @@ pub const Prompt = struct {
         while (w0 < n) : (w0 += W) {
             const k = @min(W, n - w0);
             const x = pr.x + w0 * D * 2;
-            try m.proj(s, L.q, x, m.b.q, false, k);
-            try m.proj(s, L.k, x, m.b.k, false, k);
-            try m.proj(s, L.v, x, m.b.v, false, k);
-            try m.proj(s, L.g, x, m.b.g, false, k);
+            try m.qkvg(s, L, x, m.b.q, m.b.k, m.b.v, m.b.g, k);
             var chunks: usize = 1;
             for (0..k) |j| chunks = @max(chunks, fwd.rowChunks(m.context, p0 + w0 + j));
             try m.attentionIo(s, i, k, chunks, .{ .q = m.b.q, .k = m.b.k, .v = m.b.v, .g = m.b.g, .qo = m.b.qo, .att = m.b.att, .pos = pr.pos + w0 * 4, .slot = pr.slot + w0 * 4 });
@@ -175,7 +209,8 @@ pub const Prompt = struct {
             a.add(pr.logits);
             a.add(ci(cfg.hidden));
             a.add(ci(E));
-            try cuda.launch.launch(m.f_router, .{ .grid = .{ .x = u((E + 7) / 8), .y = u(n), .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, s, &a);
+            const rw: usize = if (m.fast) 2 else 8;
+            try cuda.launch.launch(m.f_router, .{ .grid = .{ .x = u((E + rw - 1) / rw), .y = u(n), .z = 1 }, .block = .{ .x = u(32 * rw), .y = 1, .z = 1 } }, s, &a);
         }
         {
             var a: cuda.Args = .{};
@@ -209,9 +244,9 @@ pub const Prompt = struct {
             const pick = pr.pick + w0 * K * 4;
             try k3.group(s, pick, sc.ids, sc.count, sc.members, r, K, E, r);
             try k3.expertsRotIn(s, pr.latn + w0 * cfg.latent * 2, false, cfg.latent, pick, e.suh_g, e.suh_u, sc.xg, sc.xu, r, e.dims, K, E);
-            try k3.grouped(s, .{ .x0 = sc.xg, .x1 = sc.xu, .tp0 = e.gate_ptr, .tp1 = e.up_ptr, .k2_0 = e.gate_k2, .k2_1 = e.up_k2, .uids = sc.ids, .ucount = sc.count, .members = sc.members, .z = sc.z, .mats = 2, .k = e.dims, .n = e.width, .p = p, .sk = gu[2], .slots = K, .maxm = r, .nexp_max = nexp, .nt = gu[0], .warps = gu[1], .pf = gu[3], .lo = e.k2_gu[0], .hi = e.k2_gu[1] });
+            try pr.grouped(s, .{ .x0 = sc.xg, .x1 = sc.xu, .tp0 = e.gate_ptr, .tp1 = e.up_ptr, .k2_0 = e.gate_k2, .k2_1 = e.up_k2, .uids = sc.ids, .ucount = sc.count, .members = sc.members, .z = sc.z, .mats = 2, .k = e.dims, .n = e.width, .p = p, .sk = gu[2], .slots = K, .maxm = r, .nexp_max = nexp, .nt = gu[0], .warps = gu[1], .pf = gu[3], .lo = e.k2_gu[0], .hi = e.k2_gu[1] });
             try k3.gateupEpilogue(s, sc.z, pick, e.svh_g, e.svh_u, e.suh_d, sc.xd, r, p, e.width, gu[2], K, E, std.math.inf(f32), 1);
-            try k3.grouped(s, .{ .x0 = sc.xd, .x1 = sc.xd, .tp0 = e.down_ptr, .tp1 = e.down_ptr, .k2_0 = e.down_k2, .k2_1 = e.down_k2, .uids = sc.ids, .ucount = sc.count, .members = sc.members, .z = sc.z, .mats = 1, .k = e.width, .n = e.dims, .p = p, .sk = dn[2], .slots = K, .maxm = r, .nexp_max = nexp, .nt = dn[0], .warps = dn[1], .pf = dn[3], .lo = e.k2_d[0], .hi = e.k2_d[1] });
+            try pr.grouped(s, .{ .x0 = sc.xd, .x1 = sc.xd, .tp0 = e.down_ptr, .tp1 = e.down_ptr, .k2_0 = e.down_k2, .k2_1 = e.down_k2, .uids = sc.ids, .ucount = sc.count, .members = sc.members, .z = sc.z, .mats = 1, .k = e.width, .n = e.dims, .p = p, .sk = dn[2], .slots = K, .maxm = r, .nexp_max = nexp, .nt = dn[0], .warps = dn[1], .pf = dn[3], .lo = e.k2_d[0], .hi = e.k2_d[1] });
             try k3.downEpilogue(s, sc.z, pick, e.svh_d, sc.y, r, p, e.dims, dn[2], K, E); // y over xg / xu / xd (dead now)
             const y = try pr.gather(s, sc.y, p * e.dims); // z is dead too: the landing reuses it
             var a: cuda.Args = .{};
@@ -225,7 +260,7 @@ pub const Prompt = struct {
             a.add(ci(K));
             a.add(ci(m.w.rank * L.post.k));
             a.add(ci(L.post.k));
-            try cuda.launch.launch(m.f_esum, .{ .grid = .{ .x = u(r), .y = 1, .z = 1 }, .block = .{ .x = fwd.NORM_THREADS, .y = 1, .z = 1 } }, s, &a);
+            try m.rowLaunch(m.f_esum, m.f_esum_c, cfg.latent, r, s, &a);
         }
         try pr.proj(s, L.post, pr.acc, pr.part, true, n);
     }
@@ -249,10 +284,12 @@ pub const Prompt = struct {
         try m.d.check(m.d.api.cuMemcpyHtoD_v2(pr.ids, @ptrCast(pr.h_ids.ptr), n * 8), "ids");
         try m.d.check(m.d.api.cuMemcpyHtoD_v2(pr.pos, @ptrCast(pr.h_pos.ptr), n * 4), "pos");
         try m.d.check(m.d.api.cuMemcpyHtoD_v2(pr.slot, @ptrCast(pr.h_slot.ptr), n * 4), "slot");
+        if (m.w.embed == 0) try m.embedRows(pr.h_ids[0..n], pr.h_erow, pr.erow);
         {
             var a: cuda.Args = .{};
-            a.add(m.w.embed);
-            a.add(pr.ids);
+            const es = m.embedSrc(pr.ids, pr.erow, pr.iota);
+            a.add(es[0]);
+            a.add(es[1]);
             a.add(pr.res);
             a.add(ci(D));
             a.add(@as(f32, @floatCast(cfg.eps)));

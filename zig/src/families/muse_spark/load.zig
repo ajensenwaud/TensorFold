@@ -39,7 +39,10 @@ pub const Weights = struct {
     cfg: Config, // this rank's view
     rank: usize,
     world: usize,
-    embed: u64, // bf16 [V, D], every rank whole
+    embed: u64, // bf16 [V, D], every rank whole; 0 with embed_host
+    embed_host: []const u8 = &.{}, // TF_MUSE_EMBED_HOST: the table read in place from the pack's mapped file (rows staged per window)
+    embed_file: ?core.safetensors.File = null,
+    io: ?std.Io = null,
     layers: []const Layer,
     norm: u64, // fp32 [D]: w (the final norm is weighted by w, not 1 + w)
     head: exl3.Linear, // a rank's 128-row blocks of the padded head
@@ -50,6 +53,7 @@ pub const Weights = struct {
     gpa: std.mem.Allocator,
 
     pub fn deinit(w: *Weights) void {
+        if (w.embed_file) |*f| f.close(w.io.?);
         for (w.layers) |L| {
             w.gpa.free(L.experts.host_ptr);
             w.gpa.free(L.experts.host_k2);
@@ -60,7 +64,14 @@ pub const Weights = struct {
 };
 
 /// Options for partial packs: the first `max_layers` layers only (a k-layer pack, or a check on fewer).
-pub const Options = struct { max_layers: ?usize = null, log: bool = false };
+pub const Options = struct { max_layers: ?usize = null, log: bool = false, embed_host: bool = false };
+
+/// TF_MUSE_EMBED_HOST=1: keep the embedding table out of GPU memory (3.3 GB a rank): token rows are copied from the
+/// pack's file mapping (page cache, reclaimable) into each window's staging buffer.
+pub fn embedHostEnv() bool {
+    const v = std.c.getenv("TF_MUSE_EMBED_HOST") orelse return false;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
 
 pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, model_dir: []const u8, rank: usize, world: usize, opt: Options) !Weights {
     const cfg_text = try readFile(gpa, io, model_dir, "config.json");
@@ -77,7 +88,16 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, model_dir
     const ar = &w.arena;
     const emb = try ck.get(P ++ "embed_tokens.weight");
     if (emb.dtype != .bf16 or emb.shape[0] != full.vocab or emb.shape[1] != full.hidden) return error.BadEmbedding;
-    w.embed = try ar.upload(emb.bytes);
+    if (opt.embed_host) {
+        const name = P ++ "embed_tokens.weight";
+        for (ck.files.items) |*f| if (f.get(name) != null) {
+            w.embed_file = try core.safetensors.File.open(gpa, io, f.path);
+            w.io = io;
+            break;
+        };
+        const t = w.embed_file.?.get(name) orelse return error.BadEmbedding;
+        w.embed_host = t.bytes;
+    } else w.embed = try ar.upload(emb.bytes);
 
     var names: std.ArrayList(u8) = .empty;
     defer names.deinit(gpa);
