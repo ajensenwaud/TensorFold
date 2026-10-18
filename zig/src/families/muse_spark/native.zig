@@ -1,5 +1,6 @@
 //! Muse Spark behind the native server: the lane backend over engine.zig, on one GPU or two TP ranks (rank 1 runs
-//! `tf-muse follow`). After MiMo-V2's native.zig, without its prompt path: prompts run as decode windows. The DFlash2
+//! `tf-muse follow`). After MiMo-V2's native.zig: prompts of at least TF_MUSE_PROMPT_MIN rows run on the prompt path
+//! (prompt.zig, TF_MUSE_PROMPT=1), shorter ones (or all, without it) as decode windows. The DFlash2
 //! drafter is opt-in: drafts on (the server's default) AND TF_MUSE_DRAFTER naming the drafter pack on every rank.
 
 const std = @import("std");
@@ -170,7 +171,7 @@ pub const Lanes = struct {
         return l.e.logits[r * V ..][0..V];
     }
 
-    /// The prompt as decode windows of up to 128 rows; the last row's token drawn.
+    /// The prompt as prompt chunks (prompt path) or decode windows of up to 128 rows; the last row's token drawn.
     fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
         const l = of(p);
         const e = l.e;
@@ -190,6 +191,21 @@ pub const Lanes = struct {
         const slot = gop.value_ptr.slot;
         s.cached = 0;
         const greedy = s.sampling == null or s.sampling.?.temperature <= 0;
+        if (e.pr) |pr| if (ids.len >= engine.envUsize("TF_MUSE_PROMPT_MIN", 33)) {
+            const toks = try l.gpa.alloc(i64, @min(ids.len, pr.cap));
+            defer l.gpa.free(toks);
+            var at: usize = 0;
+            while (at < ids.len) {
+                if (s.isCancelled()) return error.Cancelled;
+                const n = @min(pr.cap, ids.len - at);
+                for (0..n) |j| toks[j] = ids[at + j];
+                const last = at + n == ids.len;
+                try e.prompt(slot, at, toks[0..n], if (!last) .none else if (greedy) .ids else .logits);
+                if (last) _ = l.take(if (greedy) @intCast(e.ids[0]) else try draw(l.gpa, l.rowOf(0), s.sampling, ids.len));
+                at += n;
+            }
+            return;
+        };
         var rows: [fwd.DECODE_ROWS]fwd.Row = undefined;
         var at: usize = 0;
         while (at < ids.len) {
@@ -353,7 +369,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (o.lanes == 0 or o.lanes > 32) return error.Slots;
     if (o.policy.len > 0) return error.Policy;
     const drafting = o.drafts and std.c.getenv("TF_MUSE_DRAFTER") != null; // opt-in until the drafter's gates pass
-    const su: engine.Setup = .{ .context = o.context, .slots = o.lanes, .drafts = drafting };
+    var su: engine.Setup = .{ .context = o.context, .slots = o.lanes, .drafts = drafting };
+    engine.promptEnv(&su);
     var session: ?*tp.Session = null;
     if (std.c.getenv("TF_TP_WORLD") != null) {
         const c = try tp.Config.fromEnv();

@@ -344,10 +344,15 @@ pub const Drafter = struct {
 
     /// The target's tap: residual rows after target layer `layer` (when tapped) into the tap buffer (fp16).
     pub fn tap(dr: *Drafter, s: Stream, layer: usize, res: u64, n: usize) !void {
+        return dr.tapInto(s, layer, res, n, dr.b.tapbuf);
+    }
+
+    /// tap into another buffer of the same row layout ([rows, taps, D] fp16): the prompt path's chunk-wide taps.
+    pub fn tapInto(dr: *Drafter, s: Stream, layer: usize, res: u64, n: usize, buf: u64) !void {
         for (dr.taps, 0..) |t, j| if (t == layer) {
             var a: cuda.Args = .{};
             a.add(res);
-            a.add(dr.b.tapbuf);
+            a.add(buf);
             a.add(ci(dr.c.hidden));
             a.add(ci(dr.taps.len));
             a.add(ci(j));
@@ -358,17 +363,23 @@ pub const Drafter = struct {
     /// The context update of the target's n rows (positions / slots staged in its buffers): fc, hidden_norm, then each
     /// layer's k (k_norm, RoPE at the row's position) and v into the window ring.
     pub fn update(dr: *Drafter, s: Stream, n: usize) !void {
+        return dr.updateAt(s, dr.b.tapbuf, dr.m.b.pos, dr.m.b.slot, n);
+    }
+
+    /// update from explicit taps [n, taps, D] fp16 and the rows' positions / slots (n <= the target's window rows).
+    pub fn updateAt(dr: *Drafter, s: Stream, taps: u64, pos: u64, slot: u64, n: usize) !void {
         const m = dr.m;
-        try dr.proj(s, dr.fc, dr.b.tapbuf, dr.b.ctx16, false, n);
+        if (n > m.rows) return error.WindowTooWide;
+        try dr.proj(s, dr.fc, taps, dr.b.ctx16, false, n);
         if (m.comm) |comm| {
             try comm.allGather(dr.b.ctx16, dr.b.ctxg, n * dr.fc.n, .f16, s.handle);
             try dr.rms(s, dr.b.ctxg, true, dr.fc_norm, dr.b.ctx, n, dr.fc.n);
         } else try dr.rms(s, dr.b.ctx16, true, dr.fc_norm, dr.b.ctx, n, 0);
         for (dr.layers, 0..) |L, i| {
             try dr.proj(s, L.k, dr.b.ctx, dr.b.kb, false, n);
-            try dr.normRope(s, dr.b.kb, L.k_norm, m.b.pos, m.b.slot, 0, dr.kc[i], dr.c.kv_heads, n);
+            try dr.normRope(s, dr.b.kb, L.k_norm, pos, slot, 0, dr.kc[i], dr.c.kv_heads, n);
             try dr.proj(s, L.v, dr.b.ctx, dr.b.vb, false, n);
-            try dr.store(s, dr.b.vb, m.b.pos, m.b.slot, dr.vc[i], n);
+            try dr.store(s, dr.b.vb, pos, slot, dr.vc[i], n);
         }
     }
 

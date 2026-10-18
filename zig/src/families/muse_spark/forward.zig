@@ -30,6 +30,11 @@ pub fn chunkKeys(bucket: usize) usize {
     return @max(CK, std.mem.alignForward(usize, (bucket + MAX_CHUNKS - 1) / MAX_CHUNKS, CK));
 }
 
+/// Key chunks a full layer's row at position pos reads eagerly (its own chunk width).
+pub fn rowChunks(context: usize, pos: usize) usize {
+    return pos / chunkKeys(bucketOf(context, pos + 1)) + 1;
+}
+
 /// One decode row: a stream's cache slot, its position, its input token.
 pub const Row = struct { slot: u32, pos: u32, token: i64 };
 
@@ -279,7 +284,7 @@ pub const Model = struct {
     pub fn forward(m: *Model, s: Stream, rows: []const Row, out: ?[]f32, cap: ?Capture) !void {
         try m.stage(rows);
         var chunks: usize = 1; // the most any row's own chunking takes
-        for (rows) |r| chunks = @max(chunks, r.pos / chunkKeys(bucketOf(m.context, r.pos + 1)) + 1);
+        for (rows) |r| chunks = @max(chunks, rowChunks(m.context, r.pos));
         try m.run(s, rows.len, chunks, cap);
         if (out) |o| try m.logitsTo(s, rows.len, o) else try s.synchronize();
     }
@@ -318,12 +323,12 @@ pub const Model = struct {
         if (out) |o| try m.logitsTo(s, rows.len, o) else try s.synchronize();
     }
 
-    fn norm(m: *Model, s: Stream, x: u64, x_half: bool, w: u64, out: u64, n: usize, dim: usize, eps: f64) !void {
+    pub fn norm(m: *Model, s: Stream, x: u64, x_half: bool, w: u64, out: u64, n: usize, dim: usize, eps: f64) !void {
         return m.normParts(s, x, x_half, w, out, n, dim, eps, 0);
     }
 
     /// RMS norm of n rows; `parts` > 0: x is the ranks' gathered column slices of that width.
-    fn normParts(m: *Model, s: Stream, x: u64, x_half: bool, w: u64, out: u64, n: usize, dim: usize, eps: f64, parts: usize) !void {
+    pub fn normParts(m: *Model, s: Stream, x: u64, x_half: bool, w: u64, out: u64, n: usize, dim: usize, eps: f64, parts: usize) !void {
         var a: cuda.Args = .{};
         a.add(x);
         a.add(@as(c_int, @intFromBool(x_half)));
@@ -345,10 +350,15 @@ pub const Model = struct {
     /// res = res * alpha + rms(y') * beta with y = the ranks' partials summed in rank order, then x = half(rms(res) *
     /// w_next) (muse_gate_norm).
     fn gateNorm(m: *Model, s: Stream, part: u64, scale: u64, ab: u64, w_next: u64, xf: u64, n: usize) !void {
+        const y = try m.gather(s, part, n * m.w.cfg.hidden);
+        try m.gateNormAt(s, m.b.res, y, scale, ab, w_next, m.b.x, xf, n);
+    }
+
+    /// muse_gate_norm on explicit buffers: res [n, D] fp32 in place, y the ranks' partials, x [n, D] fp16 out.
+    pub fn gateNormAt(m: *Model, s: Stream, res: u64, y: [2]u64, scale: u64, ab: u64, w_next: u64, x: u64, xf: u64, n: usize) !void {
         const cfg = m.w.cfg;
-        const y = try m.gather(s, part, n * cfg.hidden);
         var a: cuda.Args = .{};
-        a.add(m.b.res);
+        a.add(res);
         a.add(y[0]);
         a.add(y[1]);
         a.add(scale);
@@ -357,18 +367,27 @@ pub const Model = struct {
         a.add(ab);
         a.add(w_next);
         a.add(@as(f32, @floatCast(cfg.eps)));
-        a.add(m.b.x);
+        a.add(x);
         a.add(xf);
         a.add(ci(cfg.hidden));
         try cuda.launch.launch(m.f_gate, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = NORM_THREADS, .y = 1, .z = 1 } }, s, &a);
     }
 
     /// An EXL3 projection of n rows: x [n, K] fp16 -> out [n, N] fp16 or fp32.
-    fn proj(m: *Model, s: Stream, l: exl3.Linear, x: u64, out: u64, out_f32: bool, n: usize) !void {
+    pub fn proj(m: *Model, s: Stream, l: exl3.Linear, x: u64, out: u64, out_f32: bool, n: usize) !void {
         try m.k3.linear(s, l, x, .f16, m.b.xh, out, if (out_f32) .f32 else .f16, if (l.split[0] > 1) m.b.z else 0, n);
     }
 
+    /// A window's attention buffers: q, k, v, g in; qo scratch; att out; the rows' positions and slots.
+    pub const AttnIo = struct { q: u64, k: u64, v: u64, g: u64, qo: u64, att: u64, pos: u64, slot: u64 };
+
     fn attention(m: *Model, s: Stream, i: usize, n: usize, chunks: usize) !void {
+        return m.attentionIo(s, i, n, chunks, .{ .q = m.b.q, .k = m.b.k, .v = m.b.v, .g = m.b.g, .qo = m.b.qo, .att = m.b.att, .pos = m.b.pos, .slot = m.b.slot });
+    }
+
+    /// Attention of n <= rows rows (partials in the decode buffers): QK prep and cache write, chunks, merge + gate.
+    pub fn attentionIo(m: *Model, s: Stream, i: usize, n: usize, chunks: usize, io: AttnIo) !void {
+        if (n > m.rows) return error.WindowTooWide;
         const cfg = m.w.cfg;
         const H = cfg.heads;
         const HK = cfg.kv_heads;
@@ -376,9 +395,9 @@ pub const Model = struct {
         const len = if (full) m.context else m.ring;
         {
             var a: cuda.Args = .{};
-            inline for (.{ m.b.q, m.b.k, m.b.v, m.cos, m.sin }) |p| a.add(p);
+            inline for (.{ io.q, io.k, io.v, m.cos, m.sin }) |p| a.add(p);
             a.add(@as(c_int, @intFromBool(cfg.rope(i))));
-            inline for (.{ m.b.pos, m.b.slot, m.b.qo, m.kc[i], m.vc[i] }) |p| a.add(p);
+            inline for (.{ io.pos, io.slot, io.qo, m.kc[i], m.vc[i] }) |p| a.add(p);
             a.add(ci(len));
             a.add(ci(H));
             a.add(ci(HK));
@@ -389,7 +408,7 @@ pub const Model = struct {
         const nch: usize = if (full) chunks else (cfg.window + 1 + CK - 1) / CK;
         {
             var a: cuda.Args = .{};
-            inline for (.{ m.b.qo, m.kc[i], m.vc[i], m.b.pos, m.b.slot, m.b.po, m.b.pm, m.b.pl }) |p| a.add(p);
+            inline for (.{ io.qo, m.kc[i], m.vc[i], io.pos, io.slot, m.b.po, m.b.pm, m.b.pl }) |p| a.add(p);
             a.add(ci(len));
             a.add(ci(nch));
             a.add(if (full) -ci((m.context + CK - 1) / CK * CK) else ci(CK)); // full: each row's own chunk width
@@ -403,8 +422,8 @@ pub const Model = struct {
             var a: cuda.Args = .{};
             inline for (.{ m.b.po, m.b.pm, m.b.pl }) |p| a.add(p);
             a.add(ci(nch));
-            a.add(m.b.g);
-            a.add(m.b.att);
+            a.add(io.g);
+            a.add(io.att);
             a.add(ci(H));
             a.add(@as(f32, @floatCast(cfg.eps)));
             a.add(@as(c_int, @intFromBool(full)));

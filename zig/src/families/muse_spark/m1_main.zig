@@ -15,6 +15,7 @@ const tp = @import("tp");
 const muse = @import("muse_spark");
 const pair = @import("pair.zig");
 const draft_main = @import("draft_main.zig");
+const prompt_main = @import("prompt_main.zig");
 const Model = muse.forward.Model;
 
 fn env(name: [*:0]const u8, default: usize) usize {
@@ -99,9 +100,11 @@ pub fn main(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len >= 3 and std.mem.eql(u8, args[1], "follow")) return follow(init.gpa, init.io, args[2]);
     const mode: ?draft_main.Mode = if (args.len >= 2) std.meta.stringToEnum(draft_main.Mode, args[1]) else null;
-    if (args.len < 5 or (mode == null and !std.mem.eql(u8, args[1], "m1"))) {
+    const prompt_check = args.len >= 2 and std.mem.eql(u8, args[1], "prompt");
+    if (args.len < 5 or (mode == null and !prompt_check and !std.mem.eql(u8, args[1], "m1"))) {
         std.debug.print("usage: tf-muse m1 MODEL IN_DIR OUT_DIR   (knobs: MUSE_ROWS, MUSE_SLOTS, MUSE_LAYERS, MUSE_CONTEXT, MUSE_GREEDY, MUSE_CAPTURE, MUSE_TEACHER, MUSE_GRAPHS)\n" ++
             "       tf-muse dflash|drafted MODEL IN_DIR OUT_DIR   (the DFlash2 drafter's gates, TF_MUSE_DRAFTER: draft_main.zig)\n" ++
+            "       tf-muse prompt MODEL IN_DIR OUT_DIR   (the prompt path against decode rows: prompt_main.zig)\n" ++
             "       tf-muse follow MODEL   (TP rank 1 behind tensorfold-native serve on rank 0; TF_TP_* as rank 0's)\n", .{});
         return 2;
     }
@@ -119,7 +122,7 @@ pub fn main(init: std.process.Init) !u8 {
     const max_layers: ?usize = if (env("MUSE_LAYERS", 0) > 0) env("MUSE_LAYERS", 0) else null;
     if (rows_per * slots > muse.forward.DECODE_ROWS) return error.WindowTooWide;
 
-    const kn: Knobs = .{ .rows_per = rows_per, .slots = slots, .context = context, .n_greedy = n_greedy, .capture = capture, .teacher = teacher, .graphs = graphs, .max_layers = max_layers, .mode = mode, .dk = .{ .context = env("MUSE_CONTEXT", 8192), .n_greedy = env("MUSE_GREEDY", 64), .graphs = env("MUSE_GRAPHS", 1) != 0 and env("MUSE_PAIR", 0) == 0, .max_layers = max_layers, .rows_per = env("MUSE_ROWS", 32), .dump_taps = env("MUSE_DUMP_TAPS", 0) != 0 } };
+    const kn: Knobs = .{ .rows_per = rows_per, .slots = slots, .context = context, .n_greedy = n_greedy, .capture = capture, .teacher = teacher, .graphs = graphs, .max_layers = max_layers, .mode = mode, .dk = .{ .context = env("MUSE_CONTEXT", 8192), .n_greedy = env("MUSE_GREEDY", 64), .graphs = env("MUSE_GRAPHS", 1) != 0 and env("MUSE_PAIR", 0) == 0, .max_layers = max_layers, .rows_per = env("MUSE_ROWS", 32), .dump_taps = env("MUSE_DUMP_TAPS", 0) != 0 }, .prompt = prompt_check };
     const pair_mode = env("MUSE_PAIR", 0) != 0; // both ranks of TP=2 in this process on one GPU (an in-process gather)
     const tpc: ?tp.Config = if (!pair_mode and std.c.getenv("TF_TP_WORLD") != null) try tp.Config.fromEnv() else null;
     const world: usize = if (pair_mode) 2 else if (tpc) |c| c.world else 1;
@@ -158,7 +161,7 @@ pub fn main(init: std.process.Init) !u8 {
     return 0;
 }
 
-const Knobs = struct { rows_per: usize, slots: usize, context: usize, n_greedy: usize, capture: bool, teacher: bool, graphs: bool, max_layers: ?usize, mode: ?draft_main.Mode = null, dk: draft_main.Knobs };
+const Knobs = struct { rows_per: usize, slots: usize, context: usize, n_greedy: usize, capture: bool, teacher: bool, graphs: bool, max_layers: ?usize, mode: ?draft_main.Mode = null, dk: draft_main.Knobs, prompt: bool = false };
 
 fn pairRank(gpa: std.mem.Allocator, io: std.Io, driver: *const cuda.Driver, ctx: *const cuda.Context, args: []const [:0]const u8, kn: Knobs, comm: tp.Collective, err: *?anyerror) void {
     ctx.makeCurrent() catch |e| {
@@ -177,6 +180,7 @@ fn pairRank(gpa: std.mem.Allocator, io: std.Io, driver: *const cuda.Driver, ctx:
 /// One rank's m1: load, every text's windows, rank 0 writes the dumps.
 fn runRank(gpa: std.mem.Allocator, ar: std.mem.Allocator, io: std.Io, driver: *const cuda.Driver, args: []const [:0]const u8, rank: usize, world: usize, comm: ?tp.Collective, kn: Knobs) !void {
     if (kn.mode) |md| return draft_main.run(md, gpa, ar, io, driver, args, rank, world, comm, kn.dk);
+    if (kn.prompt) return prompt_main.run(gpa, ar, io, driver, args, rank, world, comm);
     var s = try cuda.Stream.init(driver, false);
     defer s.deinit();
     const t0 = std.Io.Clock.awake.now(io).toNanoseconds();

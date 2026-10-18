@@ -7,22 +7,44 @@ const tp = @import("tp");
 const load_ = @import("load.zig");
 const fwd = @import("forward.zig");
 const dflash2 = @import("dflash2.zig");
+const prompt_ = @import("prompt.zig");
 
 /// The plan link's words: one GPU step each, executed by every rank in order.
-pub const Op = enum(i64) { hello = 0x3A5E, forward = 1, draft = 2, stop = 3 };
+pub const Op = enum(i64) { hello = 0x3A5E, forward = 1, draft = 2, stop = 3, prompt = 4 };
 
 /// What rank 0 announces first so every rank builds the same model.
-pub const Setup = struct { context: usize, slots: usize, drafts: bool = false };
+/// prompt_rows > 0: the prompt path (prompt.zig) with chunks of that many rows, experts in prompt_ewin-row windows.
+pub const Setup = struct { context: usize, slots: usize, drafts: bool = false, prompt_rows: usize = 0, prompt_ewin: usize = prompt_.EWIN, prompt_exact: bool = true };
 
-/// The hello words: [hello, 3, context, slots, drafts].
-pub fn hello(su: Setup) [5]i64 {
-    return .{ @backingInt(Op.hello), 3, @intCast(su.context), @intCast(su.slots), @intFromBool(su.drafts) };
+/// The hello words: [hello, 6, context, slots, drafts, prompt rows, experts window, exact].
+pub fn hello(su: Setup) [8]i64 {
+    return .{ @backingInt(Op.hello), 6, @intCast(su.context), @intCast(su.slots), @intFromBool(su.drafts), @intCast(su.prompt_rows), @intCast(su.prompt_ewin), @intFromBool(su.prompt_exact) };
 }
 
 /// The setup a follower reads from rank 0's hello.
 pub fn setupOf(words: []const i64) !Setup {
     if (words.len < 4 or words[0] != @backingInt(Op.hello)) return error.NoHello;
-    return .{ .context = @intCast(words[2]), .slots = @intCast(words[3]), .drafts = words.len >= 5 and words[4] != 0 };
+    var su: Setup = .{ .context = @intCast(words[2]), .slots = @intCast(words[3]), .drafts = words.len >= 5 and words[4] != 0 };
+    if (words.len >= 8) {
+        su.prompt_rows = @intCast(words[5]);
+        su.prompt_ewin = @intCast(words[6]);
+        su.prompt_exact = words[7] != 0;
+    }
+    return su;
+}
+
+/// The prompt path's settings from the environment (rank 0): TF_MUSE_PROMPT=1 turns it on; TF_MUSE_PROMPT_ROWS
+/// (chunk rows, 1024), TF_MUSE_PROMPT_EWIN (experts window, 512), TF_MUSE_PROMPT_EXACT=0 (unsplit gate / up).
+pub fn promptEnv(su: *Setup) void {
+    const on = envUsize("TF_MUSE_PROMPT", 0) != 0;
+    su.prompt_rows = if (on) envUsize("TF_MUSE_PROMPT_ROWS", prompt_.CAP) else 0;
+    su.prompt_ewin = envUsize("TF_MUSE_PROMPT_EWIN", prompt_.EWIN);
+    su.prompt_exact = envUsize("TF_MUSE_PROMPT_EXACT", 1) != 0;
+}
+
+pub fn envUsize(name: [*:0]const u8, default: usize) usize {
+    const v = std.c.getenv(name) orelse return default;
+    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch default;
 }
 
 /// The drafter pack: TF_MUSE_DRAFTER (the same path on every rank), else `<pack>/dflash2`.
@@ -51,6 +73,7 @@ pub const Engine = struct {
     k3: cuda.exl3.Kernels,
     model: fwd.Model,
     dr: ?*dflash2.Drafter = null,
+    pr: ?*prompt_.Prompt = null,
     session: ?*tp.Session = null,
     s: cuda.Stream,
     logits: []f32, // [DECODE_ROWS, V] host
@@ -82,6 +105,11 @@ pub const Engine = struct {
             if (rank == 0) std.log.info("muse drafter: {s}, block {d}, {d:.2} GiB on this rank (split over {d})", .{ ddir, e.dr.?.block, @as(f64, @floatFromInt(e.dr.?.bytes())) / (1 << 30), world });
         }
         errdefer if (e.dr) |dr| dr.deinit();
+        if (su.prompt_rows > 0) {
+            e.pr = try prompt_.Prompt.init(&e.model, gpa, su.prompt_rows, su.prompt_ewin, su.prompt_exact, e.s);
+            if (rank == 0) std.log.info("muse prompt path: chunks of {d} rows, experts in {d}-row windows ({s}), {d:.2} GiB scratch", .{ e.pr.?.cap, e.pr.?.ewin, if (e.pr.?.exact) "exact" else "unsplit", @as(f64, @floatFromInt(e.pr.?.bytes())) / (1 << 30) });
+        }
+        errdefer if (e.pr) |pr| pr.deinit();
         e.logits = try gpa.alloc(f32, fwd.DECODE_ROWS * e.w.full.vocab);
         return e;
     }
@@ -90,6 +118,7 @@ pub const Engine = struct {
         const gpa = e.gpa;
         e.words.deinit(gpa);
         gpa.free(e.logits);
+        if (e.pr) |pr| pr.deinit();
         if (e.dr) |dr| dr.deinit();
         e.model.deinit();
         e.k3.deinit();
@@ -112,6 +141,22 @@ pub const Engine = struct {
         try e.send(e.words.items);
         try e.model.graphed(e.s, rows, if (want == .logits) e.logits[0 .. rows.len * e.w.full.vocab] else null);
         if (want == .ids) try e.model.argmaxTo(e.s, rows.len, e.ids[0..rows.len]);
+    }
+
+    /// A prompt chunk on every rank (prompt.zig): `tokens` at [p0, p0 + n) of `slot`; the last row's argmax in ids[0]
+    /// (`ids`) or its logits in logits[0 .. V] (`logits`).
+    pub fn prompt(e: *Engine, slot: u32, p0: usize, tokens: []const i64, want: Want) !void {
+        const pr = e.pr orelse return error.NoPromptPath;
+        e.words.clearRetainingCapacity();
+        try e.words.appendSlice(e.gpa, &.{ @backingInt(Op.prompt), @intCast(tokens.len), slot, @intCast(p0) });
+        try e.words.appendSlice(e.gpa, tokens);
+        try e.send(e.words.items);
+        try pr.chunk(e.s, slot, p0, tokens);
+        switch (want) {
+            .none => try e.s.synchronize(),
+            .ids => try e.model.argmaxTo(e.s, 1, e.ids[0..1]),
+            .logits => try e.model.logitsTo(e.s, 1, e.logits[0..e.w.full.vocab]),
+        }
     }
 
     /// A draft pass on every rank: drafts [S, block - 1] into `out` (each stream's anchor token, position, slot).
@@ -149,6 +194,12 @@ pub const Engine = struct {
                 }
                 try dr.draft(e.s, t[0..n], p[0..n], sl[0..n], &out);
             },
+            .prompt => {
+                const pr = e.pr orelse return error.NoPromptPath;
+                if (words.len != 4 + n or n > pr.cap) return error.BadPlan;
+                try pr.chunk(e.s, @intCast(words[2]), @intCast(words[3]), words[4..]);
+                try e.s.synchronize();
+            },
             .stop => return false,
             .hello => return error.LateHello,
         }
@@ -161,6 +212,8 @@ test "the hello carries the setup" {
     try std.testing.expectEqual(su, try setupOf(&hello(su)));
     const plain: Setup = .{ .context = 65536, .slots = 2 };
     try std.testing.expectEqual(plain, try setupOf(&hello(plain)));
+    const pp: Setup = .{ .context = 32768, .slots = 4, .drafts = true, .prompt_rows = 1024, .prompt_ewin = 256, .prompt_exact = false };
+    try std.testing.expectEqual(pp, try setupOf(&hello(pp)));
     try std.testing.expectEqual(plain, try setupOf(&.{ @backingInt(Op.hello), 2, 65536, 2 })); // an older rank 0
     try std.testing.expectError(error.NoHello, setupOf(&.{ 3, 0 }));
 }
