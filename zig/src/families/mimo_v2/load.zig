@@ -13,12 +13,66 @@ pub const Arena = struct {
     d: *const cuda.Driver,
     gpa: std.mem.Allocator,
     blocks: std.ArrayList(cuda.DeviceBuffer) = .empty,
+    own: std.ArrayList(cuda.DeviceBuffer) = .empty, // TF_LOAD_ARENA_MIB: requests of a block or more, each its own
+    fill: std.ArrayList(usize) = .empty, // TF_LOAD_ARENA_MIB: bytes handed out of each block
+    first_open: usize = 0, // TF_LOAD_ARENA_MIB: the first block with 4 KiB or more left
     used: usize = 0,
     total: usize = 0,
     pub const block_bytes: usize = 1 << 30;
 
+    /// TF_LOAD_ARENA_MIB=n: blocks of n MiB instead of 1 GiB, each request placed first-fit in any block (none gives
+    /// up its tail when a request does not fit), and a request of a block or more in a buffer of its own. The default
+    /// loses the newest block's tail at every switch and the last block's at the end (up to 1 GiB an arena). Unset:
+    /// the original blocks. Only addresses change, never bytes.
+    pub fn blockEnv() ?usize {
+        const S = struct {
+            var read = false;
+            var val: ?usize = null;
+        };
+        if (!S.read) {
+            S.read = true;
+            if (std.c.getenv("TF_LOAD_ARENA_MIB")) |v| {
+                const mib = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
+                if (mib > 0) S.val = mib << 20;
+            }
+        }
+        return S.val;
+    }
+
+    /// Device bytes the arena holds (blocks and own buffers), against `total` handed out.
+    pub fn reserved(a: *const Arena) usize {
+        var r: usize = 0;
+        for (a.blocks.items) |b| r += b.len;
+        for (a.own.items) |b| r += b.len;
+        return r;
+    }
+
     pub fn alloc(a: *Arena, bytes: usize) !u64 {
         const n = std.mem.alignForward(usize, @max(bytes, 1), 256);
+        if (blockEnv()) |bb| {
+            if (n >= bb) {
+                try a.own.ensureUnusedCapacity(a.gpa, 1);
+                const buf = try cuda.DeviceBuffer.alloc(a.d, n);
+                a.own.appendAssumeCapacity(buf);
+                a.total += n;
+                return buf.ptr;
+            }
+            // first fit over every block: a request that does not fit the newest block leaves no tail behind
+            var i = a.first_open;
+            while (i < a.blocks.items.len) : (i += 1) {
+                if (a.fill.items[i] + n <= a.blocks.items[i].len) break;
+            }
+            if (i == a.blocks.items.len) {
+                try a.fill.ensureUnusedCapacity(a.gpa, 1);
+                try a.blocks.append(a.gpa, try cuda.DeviceBuffer.alloc(a.d, bb));
+                a.fill.appendAssumeCapacity(0);
+            }
+            const at = a.blocks.items[i].ptr + a.fill.items[i];
+            a.fill.items[i] += n;
+            a.total += n;
+            while (a.first_open < a.blocks.items.len and a.blocks.items[a.first_open].len - a.fill.items[a.first_open] < 4096) a.first_open += 1;
+            return at;
+        }
         if (a.blocks.items.len == 0 or a.used + n > a.blocks.items[a.blocks.items.len - 1].len) {
             try a.blocks.append(a.gpa, try cuda.DeviceBuffer.alloc(a.d, @max(block_bytes, n)));
             a.used = 0;
@@ -42,11 +96,20 @@ pub const Arena = struct {
     pub fn deinit(a: *Arena) void {
         for (a.blocks.items) |*b| b.free();
         a.blocks.deinit(a.gpa);
+        for (a.own.items) |*b| b.free();
+        a.own.deinit(a.gpa);
+        a.fill.deinit(a.gpa);
     }
 };
 
 fn check(d: *const cuda.Driver, r: anytype) !void {
     try d.check(r, "mimo_v2 load");
+}
+
+/// TF_LOAD_FREE_HOST=1: linear() frees the host matrix it uploads (see there).
+pub fn freeHostEnv() bool {
+    const v = std.c.getenv("TF_LOAD_FREE_HOST") orelse return false;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
 }
 
 /// An EXL3 matrix on the host: trellis int16 [tk, tn, 8 * k2], suh fp16 [K], svh fp16 [N].
@@ -127,8 +190,11 @@ pub fn strips(a: std.mem.Allocator, m: Mat) ![]u32 {
     return out;
 }
 
-/// Exl3Linear.from_tensors (strips) on the device, with its zeroed split counters.
+/// Exl3Linear.from_tensors (strips) on the device, with its zeroed split counters. TF_LOAD_FREE_HOST=1: `m` (the
+/// caller's temporary host copy) is freed here; the original path keeps it for the life of the process (every
+/// dense matrix's host trellis: ~4.8 GB a rank on Muse Spark, in RSS or swap).
 pub fn linear(a: std.mem.Allocator, ar: *Arena, m: Mat) !exl3.Linear {
+    defer if (freeHostEnv()) m.deinit(a);
     if (m.k() % 128 != 0 or m.n() % 128 != 0) return error.NotBlocked;
     const st = try strips(a, m);
     defer a.free(st);
