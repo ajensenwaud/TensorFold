@@ -2,6 +2,7 @@
 //! `tf-muse follow`). After MiMo-V2's native.zig: prompts of at least TF_MUSE_PROMPT_MIN rows run on the prompt path
 //! (prompt.zig, TF_MUSE_PROMPT=1), shorter ones (or all, without it) as decode windows. The DFlash2
 //! drafter is opt-in: drafts on (the server's default) AND TF_MUSE_DRAFTER naming the drafter pack on every rank.
+//! TF_MUSE_PROMPT_CACHE=1 keeps prompt states for the server's prompt cache (kept.zig; the snap_* decls below).
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -10,6 +11,7 @@ const tp = @import("tp");
 const fwd = @import("forward.zig");
 const engine = @import("engine.zig");
 const dflash2 = @import("dflash2.zig");
+const kept = @import("kept.zig");
 const be = lanes.backend;
 const Engine = engine.Engine;
 
@@ -33,7 +35,7 @@ pub const Loaded = struct {
     ctx: *anyopaque,
     deinit: *const fn (*anyopaque) void,
     lone: ?LoneRun = null,
-    target: *anyopaque, // no prompt cache (no snap_* decls): never read
+    target: *anyopaque, // the prompt cache's snap_* calls get this (the Lanes)
     learns: ?*anyopaque = null, // no --slide
     learn_bytes: usize = 0,
     policy: []const u8 = "",
@@ -44,7 +46,7 @@ pub const Loaded = struct {
 const draft_prior = [_]f64{ 0.80, 0.78, 0.78, 0.78, 0.78, 0.78, 0.78 };
 const first_copy_rows = 6; // a lone stream's first copy window (MiMo's measured best beside a drafter)
 
-const Lane = struct { slot: u32, held: [16]u32 = undefined, nheld: u32 = 0 };
+const Lane = struct { slot: u32, held: [16]u32 = undefined, nheld: u32 = 0, filled: u32 = 0 }; // filled: the prompt pass's rows so far
 const ring = 1024;
 
 pub const Lanes = struct {
@@ -58,6 +60,7 @@ pub const Lanes = struct {
     shared: [32]lanes.config.Cost = undefined,
     nshared: usize = 0,
     draft_ms: f64 = 0,
+    pins: ?kept.Pins = null, // TF_MUSE_PROMPT_CACHE=1: the kept prompt states (kept.zig)
 
     fn of(p: *anyopaque) *Lanes {
         return @ptrCast(@alignCast(p));
@@ -178,7 +181,14 @@ pub const Lanes = struct {
         const ids = s.prompt();
         if (ids.len == 0 or ids.len + s.max_new + l.block() > e.model.context) return error.PromptTooLong;
         const gop = try l.lanes.getOrPut(l.gpa, s);
-        if (!gop.found_existing) {
+        s.cached = 0;
+        if (l.pins != null) {
+            if (gop.found_existing) l.free |= bit(gop.value_ptr.slot); // bound again: a kept state may want another slot
+            gop.value_ptr.* = .{ .slot = l.bind(s, ids.len) catch |err| {
+                l.lanes.removeByPtr(gop.key_ptr);
+                return err;
+            } };
+        } else if (!gop.found_existing) {
             if (l.free == 0) {
                 l.lanes.removeByPtr(gop.key_ptr);
                 return error.NoFreeSlot;
@@ -189,33 +199,87 @@ pub const Lanes = struct {
         }
         gop.value_ptr.nheld = 0;
         const slot = gop.value_ptr.slot;
-        s.cached = 0;
+        const from: usize = s.cached; // a kept state's position (bind), else 0
+        const marks: []const u32 = if (l.pins != null) s.reuse.marks else &.{};
         const greedy = s.sampling == null or s.sampling.?.temperature <= 0;
-        if (e.pr) |pr| if (ids.len >= engine.envUsize("TF_MUSE_PROMPT_MIN", 33)) {
+        if (e.pr) |pr| if (ids.len - from >= engine.envUsize("TF_MUSE_PROMPT_MIN", 33)) {
             const toks = try l.gpa.alloc(i64, @min(ids.len, pr.cap));
             defer l.gpa.free(toks);
-            var at: usize = 0;
+            var at: usize = from;
             while (at < ids.len) {
                 if (s.isCancelled()) return error.Cancelled;
-                const n = @min(pr.cap, ids.len - at);
+                if (l.pins != null and s.yields()) return error.Yielded; // a warm pass steps aside, keeping its marks
+                const n = kept.chunkRows(at, ids.len, pr.cap, marks);
                 for (0..n) |j| toks[j] = ids[at + j];
                 const last = at + n == ids.len;
                 try e.prompt(slot, at, toks[0..n], if (!last) .none else if (greedy) .ids else .logits);
                 if (last) _ = l.take(if (greedy) @intCast(e.ids[0]) else try draw(l.gpa, l.rowOf(0), s.sampling, ids.len));
                 at += n;
+                l.filledTo(s, at, marks);
             }
             return;
         };
         var rows: [fwd.DECODE_ROWS]fwd.Row = undefined;
-        var at: usize = 0;
+        var at: usize = from;
         while (at < ids.len) {
             if (s.isCancelled()) return error.Cancelled;
-            const n = @min(fwd.DECODE_ROWS, ids.len - at);
+            if (l.pins != null and s.yields()) return error.Yielded;
+            const n = kept.chunkRows(at, ids.len, fwd.DECODE_ROWS, marks);
             for (0..n) |j| rows[j] = .{ .slot = slot, .pos = @intCast(at + j), .token = ids[at + j] };
             const last = at + n == ids.len;
             try e.forward(rows[0..n], if (!last) .none else if (greedy) .ids else .logits);
             if (last) _ = l.take(if (greedy) @intCast(e.ids[n - 1]) else try draw(l.gpa, l.rowOf(n - 1), s.sampling, ids.len));
             at += n;
+            l.filledTo(s, at, marks);
+        }
+    }
+
+    fn bit(slot: u32) u32 {
+        return @as(u32, 1) << @intCast(slot);
+    }
+
+    /// The pass stands at `at` (its chunk done on the GPU): a mark there keeps the state (the cache calls snap_save).
+    fn filledTo(l: *Lanes, s: *lanes.Stream, at: usize, marks: []const u32) void {
+        if (l.lanes.getPtr(s)) |lane| lane.filled = @intCast(at);
+        if (std.mem.indexOfScalar(u32, marks, @intCast(at)) == null) return;
+        if (s.reuse.hook) |hk| hk.at(hk.ptr, s, @intCast(at));
+    }
+
+    /// The prompt cache's slot for a stream (taken from `free`): the kept state's own when it resumes one and that
+    /// slot is free; another slot with the state's full-layer rows copied in when it is busy; else the free slot whose
+    /// kept states matter least. Sets `s.cached` to where the pass starts; ends the states the pass will overwrite.
+    fn bind(l: *Lanes, s: *lanes.Stream, len: usize) !u32 {
+        const pins = &l.pins.?;
+        var out: [64]*kept.State = undefined;
+        if (s.reuse.saved) |saved| resumed: {
+            const st: *kept.State = @ptrCast(@alignCast(saved));
+            if (!st.live or st.at != s.reuse.at or st.at >= len) {
+                s.reuse_failed = true; // its rows were rewritten since: the pass runs from 0
+                break :resumed;
+            }
+            const slot = pins.resumeSlot(l.free, st) orelse return error.NoFreeSlot;
+            if (slot != st.slot) {
+                l.end(pins.overwrite(slot, 0, &out)); // the copy rewrites the rows under every state there
+                try l.e.cache(.copy, 0, st.slot, slot, st.at);
+            }
+            l.end(pins.overwrite(slot, st.at, &out));
+            try l.e.cache(.restore, st.id, slot, 0, 0);
+            pins.touch(st);
+            l.free &= ~bit(slot);
+            s.cached = st.at;
+            return slot;
+        }
+        const slot = pins.pick(l.free) orelse return error.NoFreeSlot;
+        l.end(pins.overwrite(slot, 0, &out));
+        l.free &= ~bit(slot);
+        return slot;
+    }
+
+    /// Ended states' window copies freed on every rank (the cache drops the states themselves later).
+    fn end(l: *Lanes, ended: []*kept.State) void {
+        for (ended) |st| {
+            l.e.cache(.drop, st.id, 0, 0, 0) catch continue;
+            st.freed = true;
         }
     }
 
@@ -252,6 +316,7 @@ pub const Lanes = struct {
             const lane = l.lanes.getPtr(w.stream) orelse return error.UnknownStream;
             if (n + w.rows() > rows.len) return error.WindowTooWide;
             if (w.held > lane.nheld) return error.NoHeldDrafts;
+            lane.filled = 0; // decoding: no prompt mark stands
             for (0..w.rows()) |r| {
                 const tok: u32 = if (r == 0) w.pending else if (w.held > 0) lane.held[r - 1] else w.tokens[r - 1];
                 rows[n] = .{ .slot = lane.slot, .pos = @intCast(w.positions[r] - 1), .token = tok };
@@ -363,6 +428,54 @@ pub fn draw(gpa: std.mem.Allocator, row: []const f32, settings: ?lanes.Sampling,
 
 const Owned = struct { gpa: std.mem.Allocator, e: *Engine, l: Lanes, session: ?*tp.Session };
 
+// -- the prompt cache (native/cuda.zig builds the server's store over these when snap_budget grants it room) ------
+
+/// No lookahead: a state after `at` tokens holds exactly the rows of those tokens.
+pub const snap_lookahead: u32 = 0;
+
+fn lanesOf(ptr: *anyopaque) *Lanes {
+    return @ptrCast(@alignCast(ptr));
+}
+
+/// The cache's budget: none unless TF_MUSE_PROMPT_CACHE=1; then the server's, at most TF_MUSE_PROMPT_CACHE_GIB (2).
+pub fn snap_budget(ptr: *anyopaque, server: u64) u64 {
+    if (lanesOf(ptr).pins == null) return 0;
+    const gib: f64 = if (std.c.getenv("TF_MUSE_PROMPT_CACHE_GIB")) |v| std.fmt.parseFloat(f64, std.mem.span(v)) catch 2 else 2;
+    return @min(server, std.math.lossyCast(u64, @max(gib, 0) * (1 << 30)));
+}
+
+/// A state's new device storage on each rank: its window copies (full-layer rows stay pinned in the slot).
+pub fn snap_bytes(ptr: *anyopaque, at: u32) u64 {
+    _ = at;
+    return lanesOf(ptr).e.copies.bytes;
+}
+
+/// Keep the state of `owner`'s slot after `at` prompt tokens: the pass stands there (its chunk done).
+pub fn snap_save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
+    const l = lanesOf(ptr);
+    const pins = if (l.pins) |*x| x else return error.NoPromptCache;
+    const s: *const lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
+    const lane = l.lanes.get(s) orelse return error.UnknownStream;
+    if (at == 0 or lane.filled != at) return error.NotAtMark;
+    const st = try pins.add(lane.slot, at);
+    errdefer pins.remove(st);
+    try l.e.cache(.save, st.id, lane.slot, 0, 0);
+    return st;
+}
+
+/// The lane host never restores through the cache: prefill binds the stream to the state's slot itself (bind).
+pub fn snap_restore(ptr: *anyopaque, owner: ?*anyopaque, saved: *anyopaque) anyerror!void {
+    _ = .{ ptr, owner, saved };
+    return error.RestoredByPrefill;
+}
+
+pub fn snap_drop(ptr: *anyopaque, saved: *anyopaque) void {
+    const l = lanesOf(ptr);
+    const st: *kept.State = @ptrCast(@alignCast(saved));
+    if (!st.freed) l.e.cache(.drop, st.id, 0, 0, 0) catch {};
+    if (l.pins) |*x| x.remove(st);
+}
+
 /// The native family entry: TF_TP_* for two ranks (rank 0 serves; `tf-muse follow` on rank 1); own kernels only.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
     _ = kernels; // no captured Triton set: Muse runs its own CUDA kernels
@@ -393,6 +506,13 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
     own.* = .{ .gpa = gpa, .e = e, .l = .{ .gpa = gpa, .e = e, .free = if (su.slots == 32) ~@as(u32, 0) else (@as(u32, 1) << @intCast(su.slots)) - 1 }, .session = session };
+    if (engine.envUsize("TF_MUSE_PROMPT_CACHE", 0) != 0) {
+        // kept rows must be canonical: the prompt path's unsplit gate / up (TF_MUSE_PROMPT_EXACT=0) gives other bits
+        if (e.pr != null and !e.pr.?.exact) std.log.warn("muse prompt cache off: TF_MUSE_PROMPT_EXACT=0 rows differ from decode rows", .{}) else {
+            own.l.pins = .{ .gpa = gpa };
+            std.log.info("muse prompt cache: {d:.1} MiB a kept state a rank (sliding and drafter windows; full-layer rows stay in their slot)", .{@as(f64, @floatFromInt(e.copies.bytes)) / (1 << 20)});
+        }
+    }
     try own.l.measure(io);
     @import("memlog.zig").trim(0, "costs measured");
     @import("memlog.zig").stage(0, "costs measured", "graphs {d}, captures {d}", .{ e.model.graphs.count(), e.model.captures });
@@ -405,7 +525,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .free_streams = @intCast(su.slots),
         .ctx = own,
         .deinit = release,
-        .target = own,
+        .target = &own.l,
     };
 }
 
@@ -430,6 +550,7 @@ fn release(p: *anyopaque) void {
         ss.plan.send(&.{ @backingInt(engine.Op.stop), 0 }) catch {};
     }
     own.l.lanes.deinit(own.gpa);
+    if (own.l.pins) |*x| x.deinit();
     own.e.deinit();
     if (own.session) |ss| {
         ss.announceStop();

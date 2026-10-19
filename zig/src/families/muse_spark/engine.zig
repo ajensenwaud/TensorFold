@@ -9,9 +9,10 @@ const fwd = @import("forward.zig");
 const dflash2 = @import("dflash2.zig");
 const prompt_ = @import("prompt.zig");
 const memlog = @import("memlog.zig");
+const kept = @import("kept.zig");
 
 /// The plan link's words: one GPU step each, executed by every rank in order.
-pub const Op = enum(i64) { hello = 0x3A5E, forward = 1, draft = 2, stop = 3, prompt = 4 };
+pub const Op = enum(i64) { hello = 0x3A5E, forward = 1, draft = 2, stop = 3, prompt = 4, cache = 5 };
 
 /// What rank 0 announces first so every rank builds the same model.
 /// prompt_rows > 0: the prompt path (prompt.zig) with chunks of that many rows, experts in prompt_ewin-row windows.
@@ -82,6 +83,7 @@ pub const Engine = struct {
     logits: []f32, // [DECODE_ROWS, V] host
     ids: [fwd.DECODE_ROWS]i32 = undefined, // device argmax of each row (Want.ids)
     words: std.ArrayList(i64) = .empty,
+    copies: kept.Copies = undefined, // kept prompt states' windows (kept.zig), on every rank
 
     /// Load everything on this rank. `session`: the open TP session (world > 1), null on one GPU.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, su: Setup, session: ?*tp.Session) !*Engine {
@@ -120,6 +122,8 @@ pub const Engine = struct {
             memlog.stage(rank, "prompt path", "arena {d:.1} MiB used, {d:.1} MiB held", .{ memlog.mib(e.pr.?.ar.total), memlog.mib(e.pr.?.ar.reserved()) });
         }
         errdefer if (e.pr) |pr| pr.deinit();
+        e.copies = try kept.Copies.init(gpa, &e.model, e.dr);
+        errdefer e.copies.deinit();
         e.logits = try gpa.alloc(f32, fwd.DECODE_ROWS * e.w.full.vocab);
         memlog.trim(rank, "loaded");
         memlog.stage(rank, "loaded", "graphs {d}", .{e.model.graphs.count()});
@@ -130,6 +134,7 @@ pub const Engine = struct {
         const gpa = e.gpa;
         e.words.deinit(gpa);
         gpa.free(e.logits);
+        e.copies.deinit();
         if (e.pr) |pr| pr.deinit();
         if (e.dr) |dr| dr.deinit();
         e.model.deinit();
@@ -180,6 +185,18 @@ pub const Engine = struct {
         try e.dr.?.draft(e.s, tokens, pos0, slots, out);
     }
 
+    /// A kept state's step on every rank (kept.zig): save `slot`'s windows as `id`, restore `id` into `slot`, copy the
+    /// full layers' first `at` rows of `slot` into `slot2`, or drop `id`. Rank 0 sends it before its own copy.
+    pub fn cache(e: *Engine, kind: kept.Kind, id: u64, slot: u32, slot2: u32, at: usize) !void {
+        try e.send(&kept.words(@backingInt(Op.cache), kind, id, slot, slot2, at));
+        switch (kind) {
+            .save => try e.copies.save(e.s, id, slot),
+            .restore => try e.copies.restore(e.s, id, slot),
+            .copy => try e.copies.copyPrefix(e.s, slot, slot2, at),
+            .drop => e.copies.drop(id),
+        }
+    }
+
     /// One step from the plan link, on a follower; false at stop.
     pub fn follow(e: *Engine, words: []const i64) !bool {
         if (words.len < 2) return error.ShortPlan;
@@ -212,6 +229,7 @@ pub const Engine = struct {
                 try pr.chunk(e.s, @intCast(words[2]), @intCast(words[3]), words[4..]);
                 try e.s.synchronize();
             },
+            .cache => try e.copies.follow(e.s, words),
             .stop => return false,
             .hello => return error.LateHello,
         }

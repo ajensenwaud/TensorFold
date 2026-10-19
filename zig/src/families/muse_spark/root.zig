@@ -8,6 +8,7 @@ pub const native = @import("native.zig");
 pub const dflash2 = @import("dflash2.zig");
 pub const prompt = @import("prompt.zig");
 pub const dflash2_config = @import("dflash2_config.zig");
+pub const kept = @import("kept.zig");
 pub const Config = config.Config;
 
 test {
@@ -19,4 +20,5 @@ test {
     _ = dflash2;
     _ = prompt;
     _ = dflash2_config;
+    _ = kept;
 }
