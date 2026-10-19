@@ -394,6 +394,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer gpa.destroy(own);
     own.* = .{ .gpa = gpa, .e = e, .l = .{ .gpa = gpa, .e = e, .free = if (su.slots == 32) ~@as(u32, 0) else (@as(u32, 1) << @intCast(su.slots)) - 1 }, .session = session };
     try own.l.measure(io);
+    @import("memlog.zig").trim(0, "costs measured");
+    @import("memlog.zig").stage(0, "costs measured", "graphs {d}, captures {d}", .{ e.model.graphs.count(), e.model.captures });
     return .{
         .backend = own.l.backend(),
         .facts = own.l.facts(),

@@ -8,6 +8,7 @@ const load_ = @import("load.zig");
 const fwd = @import("forward.zig");
 const dflash2 = @import("dflash2.zig");
 const prompt_ = @import("prompt.zig");
+const memlog = @import("memlog.zig");
 
 /// The plan link's words: one GPU step each, executed by every rank in order.
 pub const Op = enum(i64) { hello = 0x3A5E, forward = 1, draft = 2, stop = 3, prompt = 4 };
@@ -91,14 +92,18 @@ pub const Engine = struct {
         const world: usize = if (session) |ss| ss.cfg.world else 1;
         e.s = try cuda.Stream.init(d, false);
         errdefer e.s.deinit();
+        memlog.stage(rank, "start (context, TP session up)", "context {d} x {d} slots", .{ su.context, su.slots });
         e.w = try load_.load(gpa, io, d, dir, rank, world, .{ .log = rank == 0, .embed_host = load_.embedHostEnv() });
         errdefer e.w.deinit();
+        memlog.stage(rank, "weights", "arena {d:.1} MiB used, {d:.1} MiB held ({d} blocks + {d} own)", .{ memlog.mib(e.w.arena.total), memlog.mib(e.w.arena.reserved()), e.w.arena.blocks.items.len, e.w.arena.own.items.len });
         e.k3 = try cuda.exl3.Kernels.load(d);
         errdefer e.k3.deinit();
+        memlog.stage(rank, "exl3 kernels", "", .{});
         const comm = if (session) |ss| ss.comm() else null;
         e.model = try fwd.Model.initKv(gpa, d, &e.w, &e.k3, comm, su.context, fwd.DECODE_ROWS, su.slots, e.s, su.kv8);
         if (rank == 0 and su.kv8) std.log.info("muse kv8: full layers' caches in e4m3 (a scale per token and KV head)", .{});
         errdefer e.model.deinit();
+        memlog.stage(rank, "model", "arena {d:.1} MiB used ({d:.1} MiB KV), {d:.1} MiB held", .{ memlog.mib(e.model.arena.total), memlog.mib(e.model.kv_bytes), memlog.mib(e.model.arena.reserved()) });
         if (su.drafts) {
             const ddir = try drafterDir(gpa, dir);
             defer gpa.free(ddir);
@@ -106,14 +111,18 @@ pub const Engine = struct {
             e.dr = try dflash2.Drafter.init(gpa, io, &e.model, ddir, e.s, true, try tapsOverride(&tb));
             e.model.dr = e.dr;
             if (rank == 0) std.log.info("muse drafter: {s}, block {d}, {d:.2} GiB on this rank (split over {d})", .{ ddir, e.dr.?.block, @as(f64, @floatFromInt(e.dr.?.bytes())) / (1 << 30), world });
+            memlog.stage(rank, "drafter", "arena {d:.1} MiB used, {d:.1} MiB held", .{ memlog.mib(e.dr.?.arena.total), memlog.mib(e.dr.?.arena.reserved()) });
         }
         errdefer if (e.dr) |dr| dr.deinit();
         if (su.prompt_rows > 0) {
             e.pr = try prompt_.Prompt.init(&e.model, gpa, su.prompt_rows, su.prompt_ewin, su.prompt_exact, e.s);
             if (rank == 0) std.log.info("muse prompt path: chunks of {d} rows, experts in {d}-row windows ({s}), {d:.2} GiB scratch", .{ e.pr.?.cap, e.pr.?.ewin, if (e.pr.?.exact) "exact" else "unsplit", @as(f64, @floatFromInt(e.pr.?.bytes())) / (1 << 30) });
+            memlog.stage(rank, "prompt path", "arena {d:.1} MiB used, {d:.1} MiB held", .{ memlog.mib(e.pr.?.ar.total), memlog.mib(e.pr.?.ar.reserved()) });
         }
         errdefer if (e.pr) |pr| pr.deinit();
         e.logits = try gpa.alloc(f32, fwd.DECODE_ROWS * e.w.full.vocab);
+        memlog.trim(rank, "loaded");
+        memlog.stage(rank, "loaded", "graphs {d}", .{e.model.graphs.count()});
         return e;
     }
 

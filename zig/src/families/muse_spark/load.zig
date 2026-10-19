@@ -6,6 +6,7 @@ const cuda = @import("cuda");
 const core = @import("core");
 const mimo = @import("mimo_v2");
 const config = @import("config.zig");
+const memlog = @import("memlog.zig");
 const exl3 = cuda.exl3;
 const Config = config.Config;
 
@@ -148,6 +149,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, model_dir
         } else L.router = try ar.upload(std.mem.sliceAsBytes(rf));
         L.bias = try plusOne(gpa, ar, try ck.get(try std.fmt.bufPrint(&nb, P ++ "layers.{d}.mlp.gate.e_score_correction_bias", .{i})), 0.0);
         try layers.append(gpa, L);
+        if (memlog.dropOn()) for (ck.files.items) |*f| memlog.dropFile(f.path, f.map.memory);
         if (opt.log and (i % 8 == 7 or i == full.layers - 1)) {
             const s = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e9;
             std.debug.print("[tensorfold] muse_spark (zig): {d}/{d} layers in {d:.0}s, {d:.1} GiB\n", .{ i + 1, full.layers, s, @as(f64, @floatFromInt(ar.total)) / (1 << 30) });
@@ -163,6 +165,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, model_dir
     w.head_stride = config.headStride(hm.n(), world);
     w.head_rows = hm.n();
     w.head = try ml.linear(gpa, ar, try ml.cut(gpa, hm, mc(hc)));
+    if (memlog.dropOn()) for (ck.files.items) |*f| memlog.dropFile(f.path, f.map.memory);
     return w;
 }
 

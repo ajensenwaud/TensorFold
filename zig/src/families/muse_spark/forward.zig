@@ -7,6 +7,7 @@ const cuda = @import("cuda");
 const tp = @import("tp");
 const load_ = @import("load.zig");
 const dflash2 = @import("dflash2.zig");
+const memlog = @import("memlog.zig");
 const exl3 = cuda.exl3;
 const Weights = load_.Weights;
 const Stream = cuda.Stream;
@@ -140,6 +141,13 @@ pub const Model = struct {
     graphs: std.AutoHashMapUnmanaged([2]u32, cuda.graph.Exec) = .empty,
     replays: usize = 0,
     captures: usize = 0,
+    // TF_MUSE_GRAPHS=n: at most n decode graphs, the least recently replayed dropped first (0/unset: no limit)
+    graph_max: usize = 0,
+    graph_bucket: usize = 0, // TF_MUSE_GRAPH_BUCKET: the smallest key bucket (0: BUCKET)
+    graph_tick: u64 = 0,
+    graph_used: std.AutoHashMapUnmanaged([2]u32, u64) = .empty,
+    evictions: usize = 0,
+    kv_bytes: usize = 0, // the KV caches' device bytes (with kv8 scales)
     ring: usize,
     rows: usize,
     slots: usize,
@@ -185,6 +193,12 @@ pub const Model = struct {
         m.graphs = .empty;
         m.replays = 0;
         m.captures = 0;
+        m.graph_max = graphsEnv();
+        m.graph_bucket = graphBucketEnv();
+        m.graph_tick = 0;
+        m.graph_used = .empty;
+        m.evictions = 0;
+        m.kv_bytes = 0;
         m.ring = ringSize(cfg.window, rows);
         m.rows = rows;
         m.slots = slots;
@@ -244,6 +258,7 @@ pub const Model = struct {
             m.vc[i] = try ar.zeros(slots * n * HK * hd * eb);
             m.ks[i] = if (q8) try ar.zeros(slots * n * HK * 4) else 0;
             m.vs[i] = if (q8) try ar.zeros(slots * n * HK * 4) else 0;
+            m.kv_bytes += 2 * slots * n * HK * hd * eb + (if (q8) 2 * slots * n * HK * 4 else 0);
         }
         // RoPE tables: every RoPE layer of Muse Spark has the same theta (5e5); refuse a second one
         m.theta = 0;
@@ -336,6 +351,7 @@ pub const Model = struct {
         var it = m.graphs.valueIterator();
         while (it.next()) |e| e.deinit();
         m.graphs.deinit(m.gpa);
+        m.graph_used.deinit(m.gpa);
         m.gpa.free(m.kc);
         m.gpa.free(m.vc);
         m.gpa.free(m.ks);
@@ -409,14 +425,20 @@ pub const Model = struct {
         if (rows.len > MAX_GRAPH_ROWS) return m.forward(s, rows, out, null); // prompt windows: eager, the same bits
         var end: usize = 0;
         for (rows) |r| end = @max(end, r.pos + 1);
-        const bucket = bucketOf(m.context, end);
+        var bucket = bucketOf(m.context, end);
+        if (m.graph_bucket > bucket) bucket = @min(m.graph_bucket, (m.context + CK - 1) / CK * CK);
         const chunks = (bucket + chunkKeys(bucket) - 1) / chunkKeys(bucket); // covers every row at or under bucket
         const key: [2]u32 = .{ @intCast(rows.len), @intCast(bucket) };
         try m.stage(rows);
         if (m.graphs.get(key)) |exec| {
             try exec.launchOn(s);
             m.replays += 1;
+            if (m.graph_max > 0) {
+                m.graph_tick += 1;
+                try m.graph_used.put(m.gpa, key, m.graph_tick);
+            }
         } else {
+            if (m.graph_max > 0 and m.graphs.count() >= m.graph_max) m.evictOne();
             try m.run(s, rows.len, chunks, null); // warm-up: writes the same cache rows the replay will
             try s.synchronize();
             try cuda.graph.beginCapture(s, .thread_local);
@@ -433,8 +455,54 @@ pub const Model = struct {
             try m.graphs.put(m.gpa, key, exec);
             try exec.launchOn(s);
             m.captures += 1;
+            if (m.graph_max > 0) {
+                m.graph_tick += 1;
+                try m.graph_used.put(m.gpa, key, m.graph_tick);
+            }
+            if (memlog.on() or memlog.trimOn()) {
+                try s.synchronize();
+                memlog.trim(m.w.rank, "graph capture");
+                memlog.note(m.w.rank, "graph capture", "captures {d}, graphs {d} (rows {d}, bucket {d}), evictions {d}", .{ m.captures, m.graphs.count(), rows.len, bucket, m.evictions });
+            }
         }
         if (out) |o| try m.logitsTo(s, rows.len, o) else try s.synchronize();
+    }
+
+    /// TF_MUSE_GRAPHS: the least recently replayed decode graph dropped (every rank runs the same windows in the same
+    /// order, so every rank drops the same one; a dropped window is captured again on its next use, the same bits).
+    fn evictOne(m: *Model) void {
+        var oldest: ?[2]u32 = null;
+        var tick: u64 = std.math.maxInt(u64);
+        var it = m.graph_used.iterator();
+        while (it.next()) |e| if (e.value_ptr.* < tick) {
+            tick = e.value_ptr.*;
+            oldest = e.key_ptr.*;
+        };
+        const k = oldest orelse return;
+        if (m.graphs.fetchRemove(k)) |kv| {
+            var ex = kv.value;
+            ex.deinit();
+        }
+        _ = m.graph_used.remove(k);
+        m.evictions += 1;
+    }
+
+    /// TF_MUSE_GRAPHS=n: the decode graph cache's limit (0: none).
+    pub fn graphsEnv() usize {
+        const v = std.c.getenv("TF_MUSE_GRAPHS") orelse return 0;
+        return std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
+    }
+
+    /// TF_MUSE_GRAPH_BUCKET=n: windows whose key bucket is under n are graphed (and keyed) at bucket n (at most the
+    /// context), so those buckets share one graph a width; n >= the context gives one graph a width. The bits do not
+    /// change: a full layer's row chunks its keys by its own position (muse_attn_rows), and a larger bucket only adds
+    /// chunks past the row's last key, which write (-inf, 0) partials that the merge skips. 0/unset: a graph per
+    /// bucket (the original keys).
+    pub fn graphBucketEnv() usize {
+        const v = std.c.getenv("TF_MUSE_GRAPH_BUCKET") orelse return 0;
+        const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return 0;
+        if (n == 0) return 0;
+        return std.math.ceilPowerOfTwo(usize, @max(n, BUCKET)) catch 0;
     }
 
     pub fn norm(m: *Model, s: Stream, x: u64, x_half: bool, w: u64, out: u64, n: usize, dim: usize, eps: f64) !void {
@@ -541,6 +609,7 @@ pub const Model = struct {
         var it = m.graphs.valueIterator();
         while (it.next()) |e| e.deinit();
         m.graphs.clearRetainingCapacity();
+        m.graph_used.clearRetainingCapacity();
     }
 
     /// A block-a-row glue kernel (1024 threads) or, with TF_MUSE_FAST, its cluster twin (8 x 128 threads a row).
