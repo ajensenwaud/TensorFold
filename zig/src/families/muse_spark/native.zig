@@ -401,6 +401,7 @@ pub fn draw(gpa: std.mem.Allocator, row: []const f32, settings: ?lanes.Sampling,
     const sampling = settings orelse return @intCast(best);
     if (sampling.temperature <= 0) return @intCast(best);
     const k = if (sampling.top_k == 0) row.len else @min(row.len, sampling.top_k);
+    if (k == row.len) return @intCast(try lanes.sampling.chooseRow(gpa, row, position, sampling));
     const values = try gpa.alloc(f64, k);
     defer gpa.free(values);
     const ids = try gpa.alloc(u64, k);
@@ -408,11 +409,6 @@ pub fn draw(gpa: std.mem.Allocator, row: []const f32, settings: ?lanes.Sampling,
     var filled: usize = 0;
     for (row, 0..) |x32, id| {
         const x: f64 = x32;
-        if (k == row.len) {
-            values[id] = x;
-            ids[id] = id;
-            continue;
-        }
         if (filled == k and x <= values[k - 1]) continue;
         var at = @min(filled, k - 1);
         while (at > 0 and x > values[at - 1]) : (at -= 1) {

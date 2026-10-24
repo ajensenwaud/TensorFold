@@ -49,8 +49,16 @@ pub fn keyBits(seed: u64, position: u64, id: u64) u64 {
 
 /// Uniform (0, 1] double from the key's top 53 bits (Python `uniform`).
 pub fn uniform(seed: u64, position: u64, id: u64) f64 {
-    const x = keyBits(seed, position, id);
+    return uniformOf(keyBits(seed, position, id));
+}
+
+fn uniformOf(x: u64) f64 {
     return @as(f64, @floatFromInt(x >> 11)) * 0x1p-53 + 0x1p-54;
+}
+
+/// keyBits before the id: keyBits(seed, position, id) == mix(keyBase(seed, position) ^ id).
+fn keyBase(seed: u64, position: u64) u64 {
+    return mix(mix(seed +% 0x9E3779B97F4A7C15) ^ (position *% 0xD1B54A32D192ED03));
 }
 
 /// numpy's float64 pairwise sum (`np.add.reduce` on a contiguous row).
@@ -83,6 +91,11 @@ fn byValueThenId(_: void, a: Candidate, b: Candidate) bool {
 
 /// The id drawn among candidates `ids` with float64 logits `values` (Python `choose`, and `choose_rows` row by row).
 pub fn choose(gpa: Allocator, values: []const f64, ids: []const u64, position: u64, s: Sampling) !u64 {
+    return chooseAll(values, ids, position, s) orelse chooseSorted(gpa, values, ids, position, s);
+}
+
+/// `choose` over the whole sorted order: the reference, and the path for top_k and top_p cuts.
+pub fn chooseSorted(gpa: Allocator, values: []const f64, ids: []const u64, position: u64, s: Sampling) !u64 {
     const width = ids.len;
     const order = try gpa.alloc(Candidate, width);
     defer gpa.free(order);
@@ -128,6 +141,83 @@ pub fn choose(gpa: Allocator, values: []const f64, ids: []const u64, position: u
         }
     }
     return order[best].id;
+}
+
+/// `choose` with no cut by rank (top_k off or >= width, top_p off): the same race in id order, no sort; null otherwise.
+fn chooseAll(values: []const f64, ids: []const u64, position: u64, s: Sampling) ?u64 {
+    if (ids.len == 0 or values.len != ids.len or (s.top_k != 0 and s.top_k < ids.len)) return null;
+    return race(f64, values, ids, position, s);
+}
+
+/// `choose` over a whole row whose ids are its indices (values widened to f64 as `choose`'s callers widen them).
+pub fn chooseRow(gpa: Allocator, row: []const f32, position: u64, s: Sampling) !u64 {
+    if (row.len > 0 and (s.top_k == 0 or s.top_k >= row.len)) if (race(f32, row, null, position, s)) |id| return id;
+    const values = try gpa.alloc(f64, row.len);
+    defer gpa.free(values);
+    const ids = try gpa.alloc(u64, row.len);
+    defer gpa.free(ids);
+    for (values, ids, row, 0..) |*v, *id, x, i| {
+        v.* = x;
+        id.* = i;
+    }
+    return chooseSorted(gpa, values, ids, position, s);
+}
+
+/// The sorted loop's winner, the first maximum score in (value desc, id asc) order, in one pass; null: sort instead.
+fn race(comptime T: type, values: []const T, ids: ?[]const u64, position: u64, s: Sampling) ?u64 {
+    if (!(s.temperature > 0) or (s.top_p > 0.0 and s.top_p < 1.0) or s.min_p > 1.0) return null;
+    const t = @max(s.temperature, 1e-6);
+    const min_p = s.min_p > 0.0;
+    var floor = -std.math.inf(f64);
+    if (min_p) {
+        var top = -std.math.inf(f64);
+        for (values) |v| top = @max(top, @as(f64, v));
+        floor = top / t + s.minLog();
+    }
+    const base = keyBase(s.seed, position);
+    const bounds = skipBounds();
+    var top = -std.math.inf(f64);
+    var best: usize = 0;
+    var best_v = -std.math.inf(f64);
+    var best_score = std.math.nan(f64); // none yet
+    for (values, 0..) |v32, i| {
+        const v: f64 = v32;
+        if (std.math.isNan(v)) return null; // NaN has no place in the sorted order
+        top = @max(top, v);
+        const x = v / t;
+        if (min_p and !(x >= floor)) continue;
+        const id: u64 = if (ids) |m| m[i] else i;
+        const u = uniformOf(mix(base ^ id));
+        if (!std.math.isNan(best_score) and skips(bounds, best_score - x, u, x, best_score)) continue;
+        const score = x + -log(-log(u));
+        if (std.math.isNan(score)) continue; // a NaN score never wins (the row's max scores a number)
+        if (!std.math.isNan(best_score)) {
+            if (score < best_score) continue;
+            const best_id: u64 = if (ids) |m| m[best] else best;
+            if (score == best_score and !byValueThenId({}, .{ .value = v, .id = id }, .{ .value = best_v, .id = best_id })) continue;
+        }
+        best = i;
+        best_v = v;
+        best_score = score;
+    }
+    if (!std.math.isFinite(top) or std.math.isNan(best_score)) return null;
+    return if (ids) |m| m[best] else best;
+}
+
+/// Score gaps d and uniforms U: below U, -log(-log(u)) < d - 0.5, so a candidate that far under the best cannot win.
+pub const gaps = [_]f64{ 40, 32, 16, 8, 4, 2, 1 };
+
+pub fn skipBounds() [gaps.len]f64 {
+    var u: [gaps.len]f64 = undefined;
+    for (&u, gaps) |*b, d| b.* = exp(-exp(-(d - 0.5)));
+    return u;
+}
+
+/// Whether a candidate `d` under the best score provably scores below it (its Gumbel noise cannot close the gap).
+fn skips(bounds: [gaps.len]f64, d: f64, u: f64, x: f64, best_score: f64) bool {
+    if (!(@abs(x) <= 1e6 and @abs(best_score) <= 1e6)) return false; // rounding stays far inside the 0.5 margin
+    for (gaps, bounds) |g, b| if (d >= g) return u < b;
+    return false;
 }
 
 test "seeds keep 63 bits and uniforms fall in (0, 1]" {

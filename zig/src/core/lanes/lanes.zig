@@ -41,6 +41,7 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("engine_test.zig");
     _ = @import("gpu_full_test.zig");
+    _ = @import("sampling_test.zig");
     _ = @import("drafted_test.zig");
     _ = @import("pricing_test.zig");
 }

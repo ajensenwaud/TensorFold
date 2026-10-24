@@ -17,6 +17,7 @@ test {
     _ = forward;
     _ = engine;
     _ = native;
+    _ = @import("draw_test.zig");
     _ = dflash2;
     _ = prompt;
     _ = dflash2_config;
