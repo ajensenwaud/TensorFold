@@ -10,6 +10,7 @@ const request_guard = @import("request_guard.zig");
 const metrics = @import("metrics.zig");
 const model_text = @import("model_text.zig");
 const reply_text = @import("reply_text.zig");
+const recipient_reply = @import("recipient_reply.zig");
 const http_conn = @import("http_conn.zig");
 const listener_mod = @import("listener.zig");
 const routes = @import("routes.zig");
@@ -120,6 +121,8 @@ pub const Server = struct {
     late_system: []const u8 = "system",
     needs_user_after_tool: bool = false,
     markers: reply_text.Markers = reply_text.think_markers,
+    /// Replies are messages to recipients (`to=self` reasoning, `to=user` answer, a tool's name a call).
+    recipients: bool = false,
     close_id: ?u32 = null, // the close marker's own token, when the marker is one token
     chunks: chunk_plan.Plan = .{},
     effort_levels: []const []const u8 = &.{},
@@ -186,6 +189,7 @@ pub const Server = struct {
         srv.eos = try a.dupe(u32, text.eosIds());
         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
         srv.close_id = text.tokenId(srv.markers.close);
+        srv.recipients = recipient_reply.detect(text);
         const source = text.templateSource();
         srv.effort_levels = try fields.effortLevels(a, source);
         srv.thinking_switch = std.mem.indexOf(u8, source, "enable_thinking") != null or
