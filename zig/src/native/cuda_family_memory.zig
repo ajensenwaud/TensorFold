@@ -66,6 +66,24 @@ pub fn room(comptime F: type, ptr: *anyopaque, local: u64) !u64 {
     return local;
 }
 
+/// `p` with the family's own reserve (`memory_reserve_gib`) when TENSORFOLD_MEMORY_RESERVE_GIB is unset.
+pub fn familyPool(comptime F: type, p: budget.Pool, env: ?[]const u8) budget.Pool {
+    if (comptime !@hasDecl(F, "memory_reserve_gib")) return p;
+    if (env != null or !p.unified) return p;
+    var q = p;
+    q.reserve = @intFromFloat(@as(f64, F.memory_reserve_gib) * (1 << 30));
+    return q;
+}
+
+/// `o` with the family's own prompt-cache budget (`prompt_cache_gib`) when --prompt-cache-gib is not given.
+pub fn familyOpen(comptime F: type, o: api.Open) api.Open {
+    if (comptime !@hasDecl(F, "prompt_cache_gib")) return o;
+    if (o.prompt_cache_gib != null) return o;
+    var q = o;
+    q.prompt_cache_gib = F.prompt_cache_gib;
+    return q;
+}
+
 pub fn read(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
     const u = cuda.usage(reset_peak);
     return .{ .active = u.device, .cache = 0, .peak = u.peak, .pinned = u.host };
@@ -90,6 +108,27 @@ test "rank room is agreed before stream admission and preserves a single-rank fa
     try std.testing.expectEqual(@as(u64, 30), try room(Single, &context, 30));
     try std.testing.expectEqual(@as(u64, 19), try room(Pair, &context, 30));
     try std.testing.expectEqual(@as(u64, 7), try room(Pair, &context, 7));
+}
+
+test "a family's own reserve and cache budget apply only where the operator set none" {
+    const g: u64 = 1 << 30;
+    const Plain = struct {};
+    const Own = struct {
+        pub const memory_reserve_gib: f64 = 3;
+        pub const prompt_cache_gib: f64 = 1;
+    };
+    const p: budget.Pool = .{ .free = 20 * g, .total = 120 * g, .reserve = 12 * g, .limit = null, .unified = true };
+    try std.testing.expectEqual(12 * g, familyPool(Plain, p, null).reserve);
+    try std.testing.expectEqual(3 * g, familyPool(Own, p, null).reserve);
+    try std.testing.expectEqual(12 * g, familyPool(Own, p, "12").reserve);
+    var card = p;
+    card.unified = false;
+    try std.testing.expectEqual(12 * g, familyPool(Own, card, null).reserve);
+    const unset: api.Open = .{ .dir = "d", .model_type = "m" };
+    try std.testing.expectEqual(@as(?f64, null), familyOpen(Plain, unset).prompt_cache_gib);
+    try std.testing.expectEqual(@as(?f64, 1), familyOpen(Own, unset).prompt_cache_gib);
+    const off: api.Open = .{ .dir = "d", .model_type = "m", .prompt_cache_gib = 0 };
+    try std.testing.expectEqual(@as(?f64, 0), familyOpen(Own, off).prompt_cache_gib);
 }
 
 test {

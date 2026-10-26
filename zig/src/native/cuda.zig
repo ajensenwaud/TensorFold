@@ -28,7 +28,7 @@ const vision_offer = @import("cuda_vision_offer.zig");
 const drafted = @import("cuda_drafted.zig");
 const kv_pages = @import("cuda_kv_pool.zig");
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
-const registry = .{ nemotron.native, nemotron.omni, glm.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, gemma4.native, gemma4.native31, spark25.native, dory.native };
+const registry = .{ nemotron.native, nemotron.omni, glm.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, gemma4.native, gemma4.native31, spark25.native, dory.native, @import("muse_spark").native };
 /// --record opens here (engines.zig refuses it for a backend without this).
 pub const records = true;
 pub const backends: []const []const u8 = &.{"cuda"};
@@ -195,7 +195,8 @@ const no_stream = "the CUDA memory budget fits no stream: one at a {d}-token win
     "lower --context, or free device memory";
 const too_many = "--parallel {d} needs {d:.2} GiB for its streams at a {d}-token window, " ++
     "and the CUDA memory budget leaves {d:.2} GiB{s}: serve --parallel {d}, or lower --context";
-fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
+fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, asked: api.Open, problem: *[]const u8) !?api.Opened {
+    const o = family_memory.familyOpen(F, asked);
     if (refusals.family(F, o)) |why| {
         problem.* = why;
         return null;
@@ -270,7 +271,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
             return null;
         },
     };
-    const before = try pool(a, io, &g.ctx, problem) orelse return null;
+    const before = family_memory.familyPool(F, try pool(a, io, &g.ctx, problem) orelse return null, getenv("TENSORFOLD_MEMORY_RESERVE_GIB"));
     // a family split over hosts holds only its rank's share (GLM-5.3-Flash's TP)
     const weights = try family_memory.weights(F, a, io, o, problem) orelse return null;
     const held0 = cuda.usage(false).device;
@@ -336,7 +337,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     var served = try drafted.wrap(F, a, gpa, io, loaded, o, problem) orelse return null;
     defer if (!opened) served.close(gpa);
     const model = cuda.usage(false).device - held0;
-    const after = try pool(a, io, &g.ctx, problem) orelse return null;
+    const after = family_memory.familyPool(F, try pool(a, io, &g.ctx, problem) orelse return null, getenv("TENSORFOLD_MEMORY_RESERVE_GIB"));
     family_memory.noteParked(after, "the CUDA memory budget");
     const L = @TypeOf(loaded); // a family's Loaded may leave out a learner and a lone driver
     const learn_bytes: usize = if (@hasField(L, "learn_bytes")) loaded.learn_bytes else 0;
