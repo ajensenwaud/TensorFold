@@ -36,7 +36,6 @@ const act_round_k = @import("contract_act_round.zig");
 const f32w_k = @import("contract_glm_f32w.zig");
 
 const w4a8_k = @import("contract_w4a8.zig");
-
 const round_k = @import("contract_tree_round.zig");
 
 const act_k = @import("contract_act.zig");
@@ -367,6 +366,8 @@ pub fn run(gpu: check.Gpu) !void {
     defer gemma_ops.deinit();
     try gemma_ops.init(gpu, s, &act_rows, &vit, &round_fns, mods[5]);
     try gemma_ops.append(a, &kernels);
+    const mimo = try @import("contract_mimo.zig").Group.create(a, gpu, s, &kernels);
+    defer mimo.destroy(a);
     var vit_g4 = try vit_g4_group.Group.init(gpu, s, &vit, mods[5]);
     defer vit_g4.deinit();
     try vit_g4.append(a, &kernels);
