@@ -23,4 +23,5 @@ test {
     _ = engine;
     _ = kept;
     _ = native;
+    _ = @import("native_test.zig");
 }
