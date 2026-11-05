@@ -66,7 +66,8 @@ pub const all_metal = @import("attention_pv_records.zig").records ++
     @import("minimax_records.zig").records ++
     @import("ling_route_records.zig").records ++
     @import("qwen27_moe_records.zig").records ++
-    @import("affine_gather_records.zig").records;
+    @import("affine_gather_records.zig").records ++
+    @import("ricursive_records.zig").records;
 pub const landed_cuda = registry.cuda ++
     @import("dory_cuda_records.zig").cuda ++
     registry.gradient_pending ++
