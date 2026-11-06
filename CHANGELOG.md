@@ -2,6 +2,12 @@
 
 Each release's page on GitHub has its notes and measurements. See [the 1.0.0 release notes](RELEASE-NOTES-1.0.0.md) for the native binary's supported models and migration details.
 
+## Unreleased
+
+- Ripple-65B-Preview runs on native Metal (M5 or later) from the publisher's NVFP4 and bf16 releases as published,
+  with exact bf16 caches, thinking, tool calls and structured output; `--context` is capped at 262,144, the longest
+  checked (#2231, fixes #2171). Thanks to @BobClawblaw.
+
 ## 1.2.5
 
 - Tests: the Metal kernel contract's limits pass checks LFM3's launches again; a rebase had dropped their five entries, so the pass stopped at the first LFM3 record with `UnknownLaunch` and left every later launch unchecked (#2565).
