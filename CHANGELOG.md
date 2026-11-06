@@ -4,6 +4,10 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Ripple-65B-Preview runs on native Metal (M5 or later) from the publisher's NVFP4 and bf16 releases as published,
+  with exact bf16 caches, thinking, tool calls and structured output; `--context` is capped at 262,144, the longest
+  checked (#2231, fixes #2171). Thanks to @BobClawblaw.
+
 - File readers: a session header or Linux restart file, a conversation state file (`--learn-conversations`), an EXL3 or EXLR8 trellis shape, a DeepSeek V4.1 Engram sample row, a tokenizer vocabulary id of 2^32 - 1 or an added token whose new id would reach it, or a Drama codec storage count is refused with that reader's own error when its size, offset or count arithmetic would pass 2^64 (2^32 for u32 fields), where a safe build used to panic and a fast build could carry the wrapped value on; every file accepted before reads the same (#2618).
 
 - Sessions: a restore whose page write fails mid-stream gives back its in-flight reads' staging buffers, and a restore or park whose tier queue can't take it leaves no job behind, so neither the next restore nor the store's shutdown waits forever after such an error (#2615).
