@@ -1,4 +1,5 @@
 //! The CUDA contract's family sets, Clef's joint schema head and ZONOS3's kernels.
+//! Contract family sets: pocket, MiniMax-M3, MOSS-Image, Flash Next NVFP4, grouped affine-4, Flash Next, EXL3, Ling.
 const std = @import("std");
 const cuda = @import("cuda");
 const check = @import("check.zig");
@@ -42,6 +43,7 @@ pub const Sets = struct {
     sparse_attn: *@import("contract_sparse_attn.zig").Set,
     hy4_route_rows: *@import("contract_hy4_route_rows.zig").Set,
     hy4_engram_fp8: *@import("contract_hy4_engram_fp8.zig").Set,
+    ling: *@import("contract_ling.zig").Set,
 
     /// Each set's kernels appended to `list`, in this order.
     pub fn init(gpu: check.Gpu, s: cuda.Stream, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel), affine4: *cuda.qlinear.Affine4Kernels, cap: u32) !Sets {
@@ -128,6 +130,7 @@ pub const Sets = struct {
             a,
             list,
         );
+        const ling = try @import("contract_ling.zig").Set.init(gpu, s, a, list);
         return .{
             .gpa = gpu.gpa,
             .bf16_experts = bf16_experts,
@@ -161,6 +164,7 @@ pub const Sets = struct {
             .sparse_attn = sparse_attn,
             .hy4_route_rows = hy4_route_rows,
             .hy4_engram_fp8 = hy4_engram_fp8,
+            .ling = ling,
         };
     }
 
@@ -177,6 +181,7 @@ pub const Sets = struct {
         sets.idol.deinit();
         sets.joint_schema.deinit();
         sets.muse.destroy(sets.a);
+        sets.ling.deinit();
         sets.prompt.deinit();
         sets.gpa.destroy(sets.prompt);
         sets.shared_down.deinit();
