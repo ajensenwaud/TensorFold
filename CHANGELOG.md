@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Server: a reply that max_tokens cuts inside a JSON tool call (`<tool_call>` then `{"name": ..., "arguments": ...`, the form Ripple-65B-Preview writes) returns that call with its arguments as far as written, whole and streamed alike, instead of leaving the markup in `content`; a call cut before its name is whole, or naming a tool not offered, stays text, as XML and GLM cuts do.
+
 - Tests: the Qwen4 and Dory RoPE word-table host tests print their tables only when a comparison fails, naming the first wrong word; a passing run writes nothing to stderr (#2519, refs #1852).
 
 - Nemotron on Macs: a non-finite value in a masked key no longer reaches prompt attention's output; finite prompts run the same kernels as before, and prefill is level (#2322, part of #1009).
