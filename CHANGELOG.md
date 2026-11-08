@@ -8,6 +8,11 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
   with exact bf16 caches, thinking, tool calls and structured output; `--context` is capped at 262,144, the longest
   checked (#2231, fixes #2171). Thanks to @BobClawblaw.
 
+- Ripple-65B-Preview runs on two GB10s (DGX Spark) at `--tp 2` from ExLlamaV3 packs: each rank holds half of every
+  projection, the full layers run to a 1,048,576-token context, and rank 0 serves with kept prompt states while rank 1
+  follows; any other GPU or rank count is refused by name, one GPU staying with the one-GPU CUDA path (#2522).
+  Thanks to @BobClawblaw, turboderp and @auryn-macmillan.
+
 - Tests: the Qwen4 and Dory RoPE word-table host tests print their tables only when a comparison fails, naming the first wrong word; a passing run writes nothing to stderr (#2519, refs #1852).
 
 - Nemotron on Macs: a non-finite value in a masked key no longer reaches prompt attention's output; finite prompts run the same kernels as before, and prefill is level (#2322, part of #1009).
