@@ -250,7 +250,7 @@ test "environment: range, enum, whitespace and native prompt geometry refusals a
         .{ "TF_TIMING", "2" },                         .{ "TF_NO_TREES", "true" },
         .{ "TF_MTP_TREES", "yes" },                    .{ "TF_MTP_BATCH", "off" },
         .{ "TF_QWEN_POOL_LOG", "true" },               .{ "TF_COST_KEY_TRACE", "on" },
-        .{ "TF_LING_RANK", "2" },               .{ "TF_LING_WORLD", "3" },
+        .{ "TF_LING_RANK", "2" },                      .{ "TF_LING_WORLD", "3" },
     }) |c| try t.expectError(error.InvalidEnvironment, e.parse(c[0], c[1]));
     try t.expectEqual(@as(?u64, null), try e.parse("TF_CUDA_DEVICE", "   "));
     try t.expectEqual(@as(?u64, 0), try e.parse("TF_Q27_COPY_ROWS", "+0"));
