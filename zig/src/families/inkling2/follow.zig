@@ -230,12 +230,14 @@ pub const Leader = struct {
         try x.e.verifyShared(parts);
     }
 
-    /// The bound slot's pictures on every rank: their spans go out first, then rank 0 encodes and sends the rows.
+    /// The bound slot's pictures on every rank: rank 0 encodes them, then their spans go out and the rows follow.
     pub fn images(x: *Leader, pics: []const image.Prepared, spans: []const vision.Span) !void {
         var words: [3 * 64]u32 = undefined;
         _ = try pictures.checkSpans(spans, x.e.vision orelse return error.NoVision);
-        try x.send(.{ .kind = @backingInt(Kind.images), .depth = @intCast(spans.len) }, try pictures.toWords(spans, &words));
-        try x.e.images(pics, spans);
+        const w = try pictures.toWords(spans, &words);
+        try x.e.encode(pics, spans); // a failure here leaves the other ranks waiting for no step
+        try x.send(.{ .kind = @backingInt(Kind.images), .depth = @intCast(spans.len) }, w);
+        try x.e.shareRows(spans);
     }
 
     pub fn end(x: *Leader) !void {
