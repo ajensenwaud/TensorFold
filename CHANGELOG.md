@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- `tensorfold log` recognises request-log records by the fields each shape must carry instead of by field count, so a record with an extra field no longer splits a request and its reply into two rows (#5492, thanks @devopsfortunato).
+
 - Metal: the DFlash2 drafters' RMS norm rows and Nemotron's group norm come from one kernel body each instead of repeated copies; generated kernels and served output are unchanged (#5313, part of #2251). Thanks to @jschmied.
 
 
