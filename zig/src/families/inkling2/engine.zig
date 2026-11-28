@@ -61,7 +61,7 @@ pub const Engine = struct {
     graphs: cuda.graph_cache.Cache(Key),
     gengine: cuda.graph_cache.CudaEngine,
     states: kept.Store,
-    // shard bytes, config and stream shape (native.readyDigest); ranks compare it
+    // shard bytes, config, stream shape and graph settings (native.readyDigest); ranks compare it
     checkpoint_digest: [32]u8 = @splat(0),
     vision: ?pictures.Limits = null, // images on (--vision): every rank's rows a slot, rank 0's tower
     tower: ?*vision.Tower = null,
