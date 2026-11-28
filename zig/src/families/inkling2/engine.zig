@@ -190,16 +190,29 @@ pub const Engine = struct {
 
     /// The bound slot's pictures for its next prompt pass: rank 0 encodes them (`pics`), every rank gets the rows.
     pub fn images(e: *Engine, pics: ?[]const image.Prepared, spans: []const vision.Span) !void {
+        try e.encode(pics, spans);
+        try e.shareRows(spans);
+    }
+
+    /// Rank 0's pictures encoded into the bound slot's rows and finished; on the other ranks, the spans checked.
+    pub fn encode(e: *Engine, pics: ?[]const image.Prepared, spans: []const vision.Span) !void {
         const l = e.vision orelse return error.NoVision;
         if (e.rows.len == 0) return error.Inkling2Reserved;
-        const total = try pictures.checkSpans(spans, l);
+        _ = try pictures.checkSpans(spans, l);
         const r = &e.rows[e.slot];
         r.spans.clearRetainingCapacity();
         if (e.tower) |t| {
             const ps = pics orelse return error.ImagePlaceholders;
             if (ps.len != spans.len) return error.ImagePlaceholders;
             for (ps, spans) |p, sp| try t.encode(e.stream, p, r.buf.ptr + @as(u64, sp.row) * e.c.hidden * 2);
+            try e.stream.synchronize();
         } else if (e.exchange == .local) return error.NoVision;
+    }
+
+    /// The encoded rows from rank 0 to every rank, then the bound slot's spans in use.
+    pub fn shareRows(e: *Engine, spans: []const vision.Span) !void {
+        const total = try pictures.checkSpans(spans, e.vision orelse return error.NoVision);
+        const r = &e.rows[e.slot];
         switch (e.exchange) {
             .local => {},
             .nccl => |x| try x.lib.check(x.lib.api.ncclBroadcast(r.buf.ptr, r.buf.ptr, @as(usize, total) * e.c.hidden * 2, .u8, 0, x.comm, e.stream.handle), "ncclBroadcast"),
