@@ -301,6 +301,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.CheckpointBytesDiffer => "the two ranks' packs or settings differ: copy the same pack to both hosts and start both alike",
         error.NoVision => "images need --vision on both ranks (rank 0 runs the tower from the pack's vision.safetensors)",
         error.ImagePlaceholders => "the prompt's image placeholders do not match its pictures",
+        error.InvalidToken => "a prompt or pending token id is past the checkpoint's vocabulary",
         error.ImageTooLarge => pictures.Offer.explain(error.ImageTooLarge).?,
         else => null,
     };
