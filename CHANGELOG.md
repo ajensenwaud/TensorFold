@@ -6,6 +6,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 - Metal: the DFlash2 drafters' RMS norm rows and Nemotron's group norm come from one kernel body each instead of repeated copies; generated kernels and served output are unchanged (#5313, part of #2251). Thanks to @jschmied.
 
+
+
 - Tests: the rows regular-file test no longer shares a temporary path with the block-file test, which made it fail on Windows about one run in three (#5505).
 
 - Flash Next on CUDA with paged KV (`TF_FLASHNEXT_KV_PAGES`) no longer reserves pool snapshot slots it never uses, so the prompt cache keeps its whole budget (#5502, thanks @shantanugoel).
