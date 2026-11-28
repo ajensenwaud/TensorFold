@@ -188,6 +188,8 @@ pub const Leader = struct {
 
     /// A prompt chunk on every rank, kept state `from` restored first; the first token once it ends the prompt.
     pub fn chunk(x: *Leader, ids: []const u32, start: usize, from: ?u64, cancel: ?engine.Cancel) !?u32 {
+        // the engine's own refusals, before the step goes out: a follower that refuses a step it was sent stops
+        if (ids.len == 0 or ids.len + engine.window_rows >= x.e.capacity) return error.PromptTooLong;
         if (start >= ids.len) return error.BadChunk;
         const part = ids[start..@min(ids.len, start + engine.prompt_rows)];
         // rank 0's cancel decides before the step goes out: every rank runs a chunk it is sent
@@ -196,6 +198,8 @@ pub const Leader = struct {
             const w = x.e.states.where(id) orelse return error.SnapshotStale;
             if (w.at != start or w.slot != x.e.slot) return error.BadChunk;
         } else if (start % engine.prompt_rows != 0 or (start != 0 and start != x.e.pos())) return error.BadChunk;
+        // a pass's first chunk checks the whole prompt, so no rank runs a chunk of a prompt that is then refused
+        try checkIds(if (start == 0 or from != null) ids[start..] else part, x.e.c.real_vocab);
         try x.send(.{ .kind = @backingInt(Kind.chunk), .depth = @intCast(start), .a = ids.len, .seed = from orelse 0 }, part);
         if (from) |id| try x.e.restoreState(id);
         return x.e.prefillChunk(ids, start);
@@ -209,6 +213,9 @@ pub const Leader = struct {
         for (parts, 0..) |p, i| {
             if (n + p.ids.len > buf.len or p.ids.len == 0 or p.ids.len > engine.window_rows) return error.WindowTooWide;
             for (parts[0..i]) |q| if (q.slot == p.slot) return error.SlotTwice;
+            if (p.slot >= x.e.seqs.len) return error.Inkling2NoSlot;
+            if (x.e.st.?.pos[p.slot] + p.ids.len + 1 > x.e.capacity) return error.ContextFull;
+            try checkIds(p.ids, x.e.c.real_vocab);
             buf[2 * i] = p.slot;
             buf[2 * i + 1] = @intCast(p.ids.len);
             @memcpy(buf[n..][0..p.ids.len], p.ids);
@@ -230,6 +237,11 @@ pub const Leader = struct {
         try x.send(.{ .kind = @backingInt(Kind.end) }, &.{});
     }
 };
+
+/// Every id a token of the checkpoint's vocabulary: the embedding reads its table at an id unchecked.
+fn checkIds(ids: []const u32, vocab: u32) !void {
+    for (ids) |t| if (t >= vocab) return error.InvalidToken;
+}
 
 /// A rank other than 0 runs rank 0's steps until it ends (rank 0 decides cancels before it sends a step).
 pub fn follow(e: *Engine, link: *Link) !void {
@@ -288,4 +300,10 @@ test "a step's header is 64 bytes and keeps its fields" {
     var back: Header = undefined;
     @memcpy(std.mem.asBytes(&back), std.mem.asBytes(&h));
     try std.testing.expectEqual(h, back);
+}
+
+test "a step refuses an id past the vocabulary before it goes out" {
+    try checkIds(&.{ 0, 5, 9 }, 10);
+    try std.testing.expectError(error.InvalidToken, checkIds(&.{ 0, 10 }, 10));
+    try std.testing.expectError(error.InvalidToken, checkIds(&.{std.math.maxInt(u32)}, 10));
 }
