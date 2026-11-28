@@ -148,7 +148,7 @@ fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.e.exchange = .{ .nccl = .{ .lib = &own.lib.?, .comm = own.comm, .group = &own.group.? } };
     const hashing = content.?;
     content = null;
-    own.e.checkpoint_digest = readyDigest(try hashing.finish(), &own.e.c, cap, lim);
+    own.e.checkpoint_digest = readyDigest(try hashing.finish(), &own.e.c, cap, lim, own.e.graphs.settings.digest());
     try load_cache.finishAfter(.{ io, own.e.checkpoint_digest }, cuda.tp_watch.ready);
     // rank 0 admits by the smallest room of the ranks
     var peer: ?Peer = null;
@@ -257,10 +257,11 @@ pub fn startIdentity(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !*core
     return core.checkpoint_identity.Content.start(gpa, io, dir, false);
 }
 
-/// What the ranks compare at ready: every shard byte, the config the engine runs and the stream shape.
-pub fn readyDigest(shards: [32]u8, c: *const cfg.Config, cap: usize, lim: ?pictures.Limits) [32]u8 {
+/// What the ranks compare at ready: every shard byte, the config the engine runs, the stream shape and graph settings.
+pub fn readyDigest(shards: [32]u8, c: *const cfg.Config, cap: usize, lim: ?pictures.Limits, graphs: [10]u8) [32]u8 {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
     h.update(&shards);
+    h.update(&graphs); // the graph cache's settings: ranks vote on every capture, so they must capture alike
     c.hash(&h);
     const shape = [3]u64{ cap, if (lim) |l| l.image_tokens else 0, if (lim) |l| l.max_images else 0 };
     h.update(std.mem.sliceAsBytes(&shape));
@@ -331,10 +332,13 @@ test "native: the ready digest binds the config the engine runs, so a config-onl
     const b = try cfg.parse(gpa, other);
     try std.testing.expect(a.eps != b.eps);
     const shards: [32]u8 = @splat(7);
-    const base = readyDigest(shards, &a, capacity(131072), null);
-    try std.testing.expectEqual(base, readyDigest(shards, &try cfg.parse(gpa, text), capacity(131072), null));
-    try std.testing.expect(!std.mem.eql(u8, &base, &readyDigest(shards, &b, capacity(131072), null)));
-    try std.testing.expect(!std.mem.eql(u8, &base, &readyDigest(shards, &a, capacity(1048576), null)));
-    try std.testing.expect(!std.mem.eql(u8, &base, &readyDigest(shards, &a, capacity(131072), .{ .image_tokens = 1024, .max_images = 8 })));
-    try std.testing.expect(!std.mem.eql(u8, &base, &readyDigest(@splat(8), &a, capacity(131072), null)));
+    const graphs = (cuda.graph_cache.Settings{}).digest();
+    const base = readyDigest(shards, &a, capacity(131072), null, graphs);
+    try std.testing.expectEqual(base, readyDigest(shards, &try cfg.parse(gpa, text), capacity(131072), null, graphs));
+    try std.testing.expect(!std.mem.eql(u8, &base, &readyDigest(shards, &b, capacity(131072), null, graphs)));
+    try std.testing.expect(!std.mem.eql(u8, &base, &readyDigest(shards, &a, capacity(1048576), null, graphs)));
+    try std.testing.expect(!std.mem.eql(u8, &base, &readyDigest(shards, &a, capacity(131072), .{ .image_tokens = 1024, .max_images = 8 }, graphs)));
+    try std.testing.expect(!std.mem.eql(u8, &base, &readyDigest(@splat(8), &a, capacity(131072), null, graphs)));
+    const off = (cuda.graph_cache.Settings{ .on = false }).digest();
+    try std.testing.expect(!std.mem.eql(u8, &base, &readyDigest(shards, &a, capacity(131072), null, off)));
 }

@@ -60,7 +60,7 @@ pub const Engine = struct {
     graphs: cuda.graph_cache.Cache(Key),
     gengine: cuda.graph_cache.CudaEngine,
     states: kept.Store,
-    // shard bytes, config and stream shape (native.readyDigest); ranks compare it
+    // shard bytes, config, stream shape and graph settings (native.readyDigest); ranks compare it
     checkpoint_digest: [32]u8 = @splat(0),
     vision: ?pictures.Limits = null, // images on (--vision): every rank's rows a slot, rank 0's tower
     tower: ?*vision.Tower = null,
@@ -113,6 +113,7 @@ pub const Engine = struct {
         e.graphs = .init(gpa, e.gengine.engine(), .{});
         errdefer e.graphs.deinit();
         e.graphs.name = "inkling2 decode";
+        e.graphs.agree = .{ .ctx = e, .all = agreeAll }; // a capture or room failure on any rank sends every rank eager
         try e.stream.synchronize();
         return e;
     }
@@ -305,10 +306,7 @@ pub const Engine = struct {
         const stride = pickStride(rows);
         const vals = e.picks.ptr + sh.rank * stride;
         try ops.top1(&e.m.ops, e.stream, logits, rows, n, real, sh.vocab.lo, vals, vals + rows * 4);
-        switch (e.exchange) {
-            .local => {},
-            .nccl => |x| if (x.group) |g| try g.allGather(e.stream, vals, e.picks.ptr, stride) else try x.lib.check(x.lib.api.ncclAllGather(vals, e.picks.ptr, stride, .u8, x.comm, e.stream.handle), "ncclAllGather"),
-        }
+        try e.gatherPicks(stride);
         try e.stream.synchronize();
         try e.gathered();
         const bytes = e.picks_host[0 .. sh.world * stride];
@@ -327,6 +325,33 @@ pub const Engine = struct {
             }
             out[r] = id;
         }
+    }
+
+    /// Every rank's `stride` bytes at its own slot of `picks` into every rank's `picks`.
+    fn gatherPicks(e: *Engine, stride: usize) !void {
+        const vals = e.picks.ptr + e.w.share.rank * stride;
+        switch (e.exchange) {
+            .local => {},
+            .nccl => |x| if (x.group) |g| try g.allGather(e.stream, vals, e.picks.ptr, stride) else try x.lib.check(x.lib.api.ncclAllGather(vals, e.picks.ptr, stride, .u8, x.comm, e.stream.handle), "ncclAllGather"),
+        }
+    }
+
+    /// The graph cache's vote: true only when every rank's `ok` is, so all ranks capture or all run eager.
+    fn agreeAll(ctx: *anyopaque, ok: bool) anyerror!bool {
+        const e: *Engine = @ptrCast(@alignCast(ctx));
+        const world = e.w.share.world;
+        if (world == 1 or e.exchange == .local) return ok;
+        const stride = comptime pickStride(1);
+        var mine: [stride]u8 = @splat(0);
+        mine[0] = @intFromBool(ok);
+        try e.stream.synchronize();
+        try e.picks.upload(e.w.share.rank * stride, &mine);
+        try e.gatherPicks(stride);
+        try e.stream.synchronize();
+        try e.gathered();
+        const votes = e.picks_host[0 .. world * stride];
+        try e.picks.download(0, votes);
+        return allVoted(votes, stride);
     }
 
     /// After a synchronize: a RoCE gather that failed since the last one (its rows hold nothing valid) is an error.
@@ -359,7 +384,25 @@ pub const Engine = struct {
     }
 };
 
+/// Whether every rank's vote (byte 0 of each `stride`-byte slot) is yes.
+fn allVoted(votes: []const u8, stride: usize) bool {
+    var q: usize = 0;
+    while (q < votes.len) : (q += stride) if (votes[q] != 1) return false;
+    return true;
+}
+
 /// A rank's greedy picks of `rows` rows (fp32 values, then i32 ids) padded to 16 bytes: the RoCE gather takes them.
 fn pickStride(rows: usize) usize {
     return std.mem.alignForward(usize, rows * 8, 16);
+}
+
+test "engine: a graph vote passes only when every rank votes yes" {
+    const s = comptime pickStride(1);
+    var votes: [2 * s]u8 = @splat(0);
+    votes[0] = 1;
+    try std.testing.expect(!allVoted(&votes, s));
+    votes[s] = 1;
+    try std.testing.expect(allVoted(&votes, s));
+    votes[0] = 0;
+    try std.testing.expect(!allVoted(&votes, s));
 }
